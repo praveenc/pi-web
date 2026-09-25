@@ -121,6 +121,47 @@ html[data-theme="pine"],
   --bg-subtle: rgba(210,236,219,0.04);
 }
 
+/* Cobalt Z (https://github.com/praveenc/cobaltz): deep-blue editor surfaces
+   with the signature golden cursor as the accent. */
+html[data-theme="cobaltz"],
+[data-theme="cobaltz"] {
+  color-scheme: dark;
+  --bg: #0f2438;
+  --bg-panel: #20354a;
+  --bg-hover: #2d4051;
+  --bg-selected: #2d4a66;
+  --border: #36536b;
+  --text: #ffffff;
+  --text-muted: #c7d9e8;
+  --text-dim: #a8c6dc;
+  --accent: #ffcc00;
+  --accent-hover: #ffd940;
+  --accent-contrast: #0f2438;
+  --user-bg: #183a6c;
+  --assistant-bg: #0f2438;
+  --tool-bg: #142a3d;
+  --bg-subtle: rgba(130,170,255,0.05);
+}
+
+[data-theme="cobaltz-light"] {
+  color-scheme: light;
+  --bg: #fafbfc;
+  --bg-panel: #f1f5f9;
+  --bg-hover: #e8ecf0;
+  --bg-selected: #dbeafe;
+  --border: #cbd5e1;
+  --text: #0f2438;
+  --text-muted: #3f4b5c;
+  --text-dim: #4b5563;
+  --accent: #1d5fc7;
+  --accent-hover: #1a4fa8;
+  --accent-contrast: #ffffff;
+  --user-bg: #eaf2fe;
+  --assistant-bg: #fafbfc;
+  --tool-bg: #f4f7fa;
+  --bg-subtle: rgba(15,36,56,0.04);
+}
+
 /* WebKit reports dvh/innerHeight without the status-bar strip for installed
    home-screen apps even though the layout still starts at the screen's top.
    In standalone mode there is no browser toolbar to make vh unstable, and vh
