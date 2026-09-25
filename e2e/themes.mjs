@@ -7,7 +7,7 @@ import { chromium } from "playwright";
 const base = process.env.E2E_BASE_URL || "http://127.0.0.1:30141";
 const artifacts = fileURLToPath(new URL("../test-results/themes/", import.meta.url));
 const themes = ["light", "dark", "mist", "rose", "pine", "cobaltz", "cobaltz-light", "auto"];
-const labels = ["Light", "Dark", "Mist", "Rose", "Pine", "Cobalt Z", "Cobalt Z Light", "System"];
+const labels = ["Light", "Dark", "Mist", "Rose", "Pine", "CobaltZ", "CobaltZ Light", "System"];
 const darkThemes = new Set(["dark", "pine", "cobaltz"]);
 await mkdir(artifacts, { recursive: true });
 const browser = await chromium.launch();
