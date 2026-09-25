@@ -28,11 +28,8 @@ export function ThemeIcon({ preference, size = 17 }: { preference: ThemePreferen
   if (preference === "pine") {
     return <svg {...common}><path d="M12 3c-.9 2.5-2.3 4.2-4.5 6h3c-1 2.1-2.6 3.7-5 5.3h4c-.7 2-1.9 3.8-3.7 5.4h12.4c-1.8-1.6-3-3.4-3.7-5.4h4c-2.4-1.6-4-3.2-5-5.3h3c-2.2-1.8-3.6-3.5-4.5-6Z" /><path d="M12 20v2" /></svg>;
   }
-  if (preference === "cobaltz") {
+  if (preference === "cobaltz" || preference === "cobaltz-light") {
     return <svg {...common}><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12L13 2Z" /></svg>;
-  }
-  if (preference === "cobaltz-light") {
-    return <svg {...common}><circle cx="12" cy="12" r="9.5" /><path d="M13 5.5 8 12.8h3.6l-.6 5.7 5-7.3h-3.6l.6-5.7Z" /></svg>;
   }
   return <svg {...common}><rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 21h8M12 17v4" /></svg>;
 }

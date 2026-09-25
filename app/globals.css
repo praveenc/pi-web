@@ -121,7 +121,7 @@ html[data-theme="pine"],
   --bg-subtle: rgba(210,236,219,0.04);
 }
 
-/* Cobalt Z (https://github.com/praveenc/cobaltz): deep-blue editor surfaces
+/* CobaltZ (https://github.com/praveenc/cobaltz): deep-blue editor surfaces
    with the signature golden cursor as the accent. */
 html[data-theme="cobaltz"],
 [data-theme="cobaltz"] {
