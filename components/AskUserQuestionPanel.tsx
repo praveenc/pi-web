@@ -225,7 +225,7 @@ export function AskUserQuestionPanel({
 
 /** Whether the user has done anything on this question; untouched multi-selects are not "answered" yet. */
 function isTouched(question: AskUserQuestion, draft: QuestionDraft): boolean {
-  return question.multiSelect ? draft.checked.length > 0 || draft.text.trim().length > 0 : true;
+  return question.multiSelect ? draft.checked.length > 0 || (draft.custom && draft.text.trim().length > 0) : true;
 }
 
 function TabChip({ active, done, label, onClick }: { active: boolean; done: boolean; label: string; onClick: () => void }) {
@@ -288,12 +288,17 @@ function QuestionView({
 
   const choose = (index: number) => {
     if (index === customRowIndex) {
-      onChange((current) => ({ ...current, custom: question.multiSelect ? !current.custom : true }));
+      // On multi-select the typed answer replaces the checked options instead of joining
+      // them: the extension reads any non-index reply as one custom answer.
+      onChange((current) => question.multiSelect && current.custom
+        ? { ...current, custom: false }
+        : { ...current, custom: true, checked: [] });
       return;
     }
     if (question.multiSelect) {
       onChange((current) => ({
         ...current,
+        custom: false,
         checked: current.checked.includes(index)
           ? current.checked.filter((value) => value !== index)
           : [...current.checked, index],
@@ -359,7 +364,7 @@ function QuestionView({
           ))}
           <OptionRow
             index={customRowIndex}
-            multiSelect={question.multiSelect}
+            multiSelect={false}
             chosen={draft.custom}
             label={t("chat.questionnaireTypeSomething")}
             onFocus={() => onPreview(null)}
@@ -562,7 +567,6 @@ function answerSummary(question: AskUserQuestion, answer: AskUserQuestionAnswer 
   if (answer.kind === "option") return question.options[answer.optionIndex]?.label ?? null;
   if (answer.kind === "custom") return `“${answer.text}”`;
   const labels = answer.optionIndexes.map((index) => question.options[index]?.label).filter(Boolean);
-  if (answer.text) labels.push(`“${answer.text}”`);
   return labels.length > 0 ? labels.join(", ") : noneSelected;
 }
 

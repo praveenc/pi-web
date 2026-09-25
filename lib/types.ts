@@ -147,7 +147,7 @@ export interface AskUserQuestion {
 
 export type AskUserQuestionAnswer =
   | { kind: "option"; optionIndex: number }
-  | { kind: "multi"; optionIndexes: number[]; text?: string }
+  | { kind: "multi"; optionIndexes: number[] }
   | { kind: "custom"; text: string };
 
 export type ExtensionUiRequest =

@@ -109,19 +109,13 @@ function firstStepShape(question: AskUserQuestion): { method: "select" | "input"
   return { method: question.multiSelect ? "input" : "select", question };
 }
 
-/**
- * Text for a multi-select answer. Selections alone become the 1-based index list the
- * extension parses; a typed answer turns the whole reply into a custom answer, so the
- * checked labels are folded into it instead of being dropped.
- */
-function multiSelectValue(question: AskUserQuestion, optionIndexes: number[], text: string): string {
-  const indexes = [...new Set(optionIndexes)]
+/** The 1-based index list the extension parses as a multi-select selection. */
+function multiSelectIndexes(question: AskUserQuestion, optionIndexes: number[]): string {
+  return [...new Set(optionIndexes)]
     .filter((index) => Number.isInteger(index) && index >= 0 && index < question.options.length)
-    .sort((a, b) => a - b);
-  const typed = text.trim();
-  if (!typed) return indexes.map((index) => String(index + 1)).join(",");
-  const labels = indexes.map((index) => question.options[index].label);
-  return labels.length > 0 ? `${labels.join(", ")}; ${typed}` : typed;
+    .sort((a, b) => a - b)
+    .map((index) => String(index + 1))
+    .join(",");
 }
 
 /** Expand submitted answers into the exact dialog sequence the extension will open. */
@@ -136,9 +130,8 @@ export function buildQuestionnaireScript(
     const answer = answers[index];
     if (question.multiSelect) {
       if (answer.kind === "option") return null;
-      const value = answer.kind === "multi"
-        ? multiSelectValue(question, answer.optionIndexes, answer.text ?? "")
-        : multiSelectValue(question, [], answer.text);
+      // Any non-index token makes the extension treat the whole reply as a custom answer.
+      const value = answer.kind === "multi" ? multiSelectIndexes(question, answer.optionIndexes) : answer.text.trim();
       steps.push({ method: "input", question, value });
       continue;
     }
@@ -277,7 +270,7 @@ export interface QuestionDraft {
   selected: number | null;
   /** Multi-select: the checked options. */
   checked: number[];
-  /** The "Type something." row is chosen (single-select) or holds text (multi-select). */
+  /** The "Type something." row is chosen; on multi-select it excludes the checked options. */
   custom: boolean;
   text: string;
 }
@@ -287,15 +280,14 @@ export function emptyQuestionDraft(): QuestionDraft {
 }
 
 /**
- * The answer a draft submits, or null while a single-select question is unanswered.
- * A multi-select question may be committed with nothing checked, as in the TUI.
+ * The answer a draft submits, or null while the question is unanswered. A multi-select
+ * question may be committed with nothing checked, as in the TUI.
  */
 export function draftToAnswer(question: AskUserQuestion, draft: QuestionDraft): AskUserQuestionAnswer | null {
   const text = draft.text.trim();
   if (question.multiSelect) {
-    const optionIndexes = [...draft.checked].sort((a, b) => a - b);
-    if (draft.custom && text) return optionIndexes.length > 0 ? { kind: "multi", optionIndexes, text } : { kind: "custom", text };
-    return { kind: "multi", optionIndexes };
+    if (draft.custom) return text ? { kind: "custom", text } : null;
+    return { kind: "multi", optionIndexes: [...draft.checked].sort((a, b) => a - b) };
   }
   if (draft.custom) return text ? { kind: "custom", text } : null;
   return draft.selected === null ? null : { kind: "option", optionIndex: draft.selected };
