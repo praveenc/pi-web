@@ -12,6 +12,7 @@ import { getAssistantErrorMessage, getThinkingPreview, isAssistantTruncated, isE
 import { parseUnifiedPatch, type SplitDiffCell, type SplitDiffFile } from "@/lib/patch";
 import { applyPatchPreviewToFiles, applyPatchResultHasFailures, extractApplyPatchPaths, getApplyPatchInputText, parseApplyPatchInput } from "@/lib/apply-patch";
 import { isApplyPatchToolName, isEditToolName } from "@/lib/tool-names";
+import { ASK_USER_QUESTION_TOOL_NAME, parseAskUserQuestionArgs } from "@/lib/ask-user-question";
 import { isToolCallExpanded, setToolCallExpanded } from "@/lib/tool-call-expansion";
 import { isThinkingExpandedByDefault, THINKING_EXPANDED_EVENT } from "@/lib/thinking-expansion-preference";
 import { TurnWrittenFiles } from "./TurnWrittenFiles";
@@ -1832,6 +1833,10 @@ function getToolPreview(block: ToolCallContent): string {
   if ("path" in input) return String(input.path).slice(0, 120);
   if ("file_path" in input) return String(input.file_path).slice(0, 120);
   if ("pattern" in input) return String(input.pattern).slice(0, 120);
+  if (block.toolName === ASK_USER_QUESTION_TOOL_NAME) {
+    const questions = parseAskUserQuestionArgs(input);
+    if (questions) return questions.map((question) => question.header || question.question).join(" · ").slice(0, 120);
+  }
   if ("query" in input) return String(input.query).slice(0, 120);
 
   const first = input[keys[0]];

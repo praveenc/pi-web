@@ -96,6 +96,7 @@ app/api/
 
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
+  ask-user-question.ts  bridge from rpiv-ask-user-question's per-question dialogs to one questionnaire form
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
@@ -123,6 +124,7 @@ components/
   MessageView.tsx     renders one message (user/assistant/toolCall/toolResult)
   BranchNavigator.tsx in-session branch switcher
   ChatMinimap.tsx     scroll minimap alongside the message list
+  AskUserQuestionPanel.tsx  questionnaire form for ask_user_question (tabs, options, previews, review)
   MarkdownBody.tsx    markdown renderer
   ModelsConfig.tsx    modal for editing models.json (opened from sidebar bottom)
   EnabledModelsSection.tsx  model switches inside ModelsConfig, backed by enabledModels
@@ -259,6 +261,11 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - `hooks/useAudio.ts` stores the toggle in `localStorage` as `pi-sound-enabled` and reuses one `AudioContext`.
 - Browser autoplay policy means sound must be unlocked from a user gesture; `ChatInput` calls the unlock hook from interactive controls, and `ChatWindow` plays the tone from `onAgentEnd`.
 
+### `ask_user_question` questionnaire
+- `@juicesharp/rpiv-ask-user-question` sees `ctx.mode === "rpc"` in Pi Web, so it skips its terminal overlay and walks the questions with one `select` (plus an `input` after "Type something.") or one multi-select `input` per question. `lib/ask-user-question.ts` recognizes the first dialog of an active `ask_user_question` tool call by its title prefix (`[header] question`) and option count, and emits a single `extension_ui_request` with `method: "questionnaire"` carrying every question, previews included.
+- The browser answers with `{ answers }` on the same `extension_ui_response` command. The bridge then replays those answers into the extension's dialog sequence (option rows by index, multi-select as `"1,3"`, typed text through the follow-up input), so the extension still builds the result envelope the model sees. Cancel returns `{ cancelled: true }` to the first dialog, which the extension reports as declined.
+- Any dialog that does not fit the expected sequence ends the bridge for that call and is shown as an ordinary dialog; unrelated select/input dialogs are never captured. The questionnaire request goes through `requestExtensionUi()`, so SSE replay, abort, and `extension_ui_closed` behave like every other dialog.
+
 ### Exported session HTML
 - `/api/sessions/[id]/export` delegates to pi's export helper, then patches recursive tree helpers in the generated HTML to iterative versions so very deep linear sessions do not overflow the browser call stack.
 
@@ -288,6 +295,5 @@ Location: `~/.pi/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl`
 --accent --user-bg --tool-bg
 --font-mono
 ```
-
 
 

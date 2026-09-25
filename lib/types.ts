@@ -131,6 +131,25 @@ export interface SystemMessage {
 /** Any message a `message` entry can store, including transcript system messages. */
 export type SessionMessage = AgentMessage | SystemMessage;
 
+export interface AskUserQuestionOption {
+  label: string;
+  description: string;
+  preview?: string;
+}
+
+/** One question of an `ask_user_question` tool call (`@juicesharp/rpiv-ask-user-question`). */
+export interface AskUserQuestion {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: AskUserQuestionOption[];
+}
+
+export type AskUserQuestionAnswer =
+  | { kind: "option"; optionIndex: number }
+  | { kind: "multi"; optionIndexes: number[]; text?: string }
+  | { kind: "custom"; text: string };
+
 export type ExtensionUiRequest =
   | {
       type: "extension_ui_request";
@@ -208,17 +227,26 @@ export type ExtensionUiRequest =
       method: "custom";
       lines: string[];
       closed?: boolean;
+    }
+  | {
+      /** Pi Web's form for the whole `ask_user_question` call; see `lib/ask-user-question.ts`. */
+      type: "extension_ui_request";
+      id: string;
+      method: "questionnaire";
+      toolCallId: string;
+      questions: AskUserQuestion[];
     };
 
 export type BlockingExtensionUiRequest = Extract<
   ExtensionUiRequest,
-  { method: "select" | "confirm" | "input" | "editor" | "custom" }
+  { method: "select" | "confirm" | "input" | "editor" | "custom" | "questionnaire" }
 >;
 
 export type ExtensionUiResponse =
   | { type: "extension_ui_response"; id: string; value: string }
   | { type: "extension_ui_response"; id: string; confirmed: boolean }
-  | { type: "extension_ui_response"; id: string; cancelled: true };
+  | { type: "extension_ui_response"; id: string; cancelled: true }
+  | { type: "extension_ui_response"; id: string; answers: AskUserQuestionAnswer[] };
 
 export interface ExtensionStatusItem {
   key: string;

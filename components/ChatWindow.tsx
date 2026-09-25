@@ -11,6 +11,7 @@ import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-fi
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
 import { MarkdownBody } from "./MarkdownBody";
+import { AskUserQuestionPanel } from "./AskUserQuestionPanel";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs } from "./ChatMinimap";
 import { ExtensionStatusBar } from "./ExtensionStatusBar";
@@ -281,6 +282,7 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput, setNoticePaused,
+    questionnaire, respondToQuestionnaire,
     isAutoModelSelection,
     isAutoThinkingSelection,
     agentPhase,
@@ -458,6 +460,16 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
     soundedExtensionDialogIdRef.current = extensionDialog.id;
     playDoneSoundRef.current();
   }, [completionNotificationsEnabled, extensionDialog]);
+
+  useEffect(() => {
+    if (
+      !completionNotificationsEnabled
+      || !questionnaire
+      || soundedExtensionDialogIdRef.current === questionnaire.id
+    ) return;
+    soundedExtensionDialogIdRef.current = questionnaire.id;
+    playDoneSoundRef.current();
+  }, [completionNotificationsEnabled, questionnaire]);
 
   // Register the abort handler for the global Esc shortcut
   useEffect(() => {
@@ -983,6 +995,9 @@ export function ChatWindow({ session, searchTarget, onSearchTargetHandled, initi
       <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
         {extensionDialog && (
           <ExtensionDialog key={extensionDialog.id} request={extensionDialog} onRespond={respondToExtensionUi} />
+        )}
+        {questionnaire && (
+          <AskUserQuestionPanel key={questionnaire.id} request={questionnaire} onRespond={respondToQuestionnaire} />
         )}
         {extensionCustomUi && (
           <ExtensionCustomPanel key={extensionCustomUi.id} request={extensionCustomUi} onInput={sendExtensionCustomInput} />

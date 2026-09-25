@@ -3,6 +3,7 @@
 import { useState, useCallback, useRef, useEffect, useLayoutEffect, useMemo, useReducer } from "react";
 import type {
   AgentMessage,
+  AskUserQuestionAnswer,
   BlockingExtensionUiRequest,
   ExtensionStatusItem,
   ExtensionUiRequest,
@@ -107,6 +108,7 @@ function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] 
 
 type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
 type ExtensionUiCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
+type ExtensionUiQuestionnaireRequest = Extract<ExtensionUiRequest, { method: "questionnaire" }>;
 export type NoticeType = "info" | "success" | "warning" | "error";
 
 export type NoticeItem = {
@@ -351,6 +353,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [sessionStatsOverride, setSessionStatsOverride] = useState<SessionStatsInfo | null>(null);
   const [extensionDialog, setExtensionDialog] = useState<ExtensionUiDialogRequest | null>(null);
   const [extensionCustomUi, setExtensionCustomUi] = useState<ExtensionUiCustomRequest | null>(null);
+  const [questionnaire, setQuestionnaire] = useState<ExtensionUiQuestionnaireRequest | null>(null);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
@@ -954,6 +957,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
+  const respondToQuestionnaire = useCallback(async (
+    request: ExtensionUiQuestionnaireRequest,
+    response: { answers: AskUserQuestionAnswer[] } | { cancelled: true },
+  ) => {
+    const sid = sessionIdRef.current;
+    setQuestionnaire((current) => current?.id === request.id ? null : current);
+    if (!sid) return;
+    try {
+      await sendAgentCommand(sid, {
+        type: "extension_ui_response",
+        id: request.id,
+        ...response,
+      });
+    } catch (e) {
+      console.error("Failed to send questionnaire response:", e);
+    }
+  }, []);
+
   const sendExtensionCustomInput = useCallback(async (request: ExtensionUiCustomRequest, data: string) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
@@ -990,6 +1011,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "input":
       case "editor":
         setExtensionDialog(request);
+        break;
+      case "questionnaire":
+        setQuestionnaire(request);
         break;
       case "notify": {
         addNotice({
@@ -1515,6 +1539,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         break;
       case "extension_ui_closed":
         setExtensionDialog((current) => current?.id === event.id ? null : current);
+        setQuestionnaire((current) => current?.id === event.id ? null : current);
         break;
     }
   }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage, syncLiveModel]);
@@ -2438,6 +2463,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats, autoCompactionEnabled,
     slashCommands, slashCommandsLoading, queuedMessages,
     notices: noticeState.visible, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput,
+    questionnaire, respondToQuestionnaire,
     isAutoModelSelection: isNew && newSessionModel === null,
     isAutoThinkingSelection: isNew && newSessionThinkingLevel === null,
     agentPhase,
