@@ -340,6 +340,7 @@ export const enLocale: LocalePlugin = {
     "chat.questionnaireTypeSomething": "Type something.",
     "chat.questionnaireTypePlaceholder": "Type your answer",
     "chat.questionnaireMultiHint": "Select all that apply",
+    "chat.questionnaireNumbersOnly": "Numbers alone are read as option numbers. Add a word, or tick the options instead.",
     "chat.questionnairePreview": "Preview",
     "chat.questionnaireNext": "Next",
     "chat.questionnaireBack": "Back",

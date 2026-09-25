@@ -19,8 +19,8 @@ import type {
  * side by side. Instead, the first dialog of a recognized `ask_user_question` call opens
  * the whole questionnaire in the browser; once it is submitted, every dialog in the
  * sequence is answered from that submission, so the extension still builds the result
- * envelope the model sees. Any dialog that does not match the expected sequence ends the
- * bridge for that call and is shown as an ordinary dialog.
+ * envelope the model sees. Any dialog that does not match the expected sequence is shown
+ * as an ordinary dialog and leaves the call's questionnaire in place.
  */
 
 export const ASK_USER_QUESTION_TOOL_NAME = "ask_user_question";
@@ -118,6 +118,21 @@ function multiSelectIndexes(question: AskUserQuestion, optionIndexes: number[]):
     .join(",");
 }
 
+/**
+ * Whether the extension would read `text` as a multi-select selection rather than a
+ * typed answer: every token is an in-range option number (`"2"`, `"1 3"`, `"2."`).
+ * Mirrors `askMultiSelect` in the extension's rpc-fallback.ts. Such text cannot be sent
+ * as a custom answer, so the panel asks for different wording instead.
+ */
+export function isIndexOnlyText(question: AskUserQuestion, text: string): boolean {
+  const tokens = text.trim().split(/[,\s]+/).filter((token) => token.length > 0);
+  return tokens.length > 0 && tokens.every((token) => {
+    if (!/^\d+\.?$/.test(token)) return false;
+    const index = Number.parseInt(token, 10) - 1;
+    return index >= 0 && index < question.options.length;
+  });
+}
+
 /** Expand submitted answers into the exact dialog sequence the extension will open. */
 export function buildQuestionnaireScript(
   questions: AskUserQuestion[],
@@ -130,6 +145,7 @@ export function buildQuestionnaireScript(
     const answer = answers[index];
     if (question.multiSelect) {
       if (answer.kind === "option") return null;
+      if (answer.kind === "custom" && isIndexOnlyText(question, answer.text)) return null;
       // Any non-index token makes the extension treat the whole reply as a custom answer.
       const value = answer.kind === "multi" ? multiSelectIndexes(question, answer.optionIndexes) : answer.text.trim();
       steps.push({ method: "input", question, value });
@@ -231,14 +247,13 @@ export class QuestionnaireBridge {
     if (stepIndex === 0) {
       if (!stepMatches(firstStepShape(session.questions[0]), dialog)) return null;
     } else {
-      // Later dialogs only open after the first one was answered, so the script is
-      // known. A dialog outside the sequence belongs to someone else: stop answering
-      // for this call and let it through.
+      // The extension opens its next dialog only after the previous one was
+      // answered, so a dialog that does not match the next step - including any
+      // dialog while the questionnaire is still open - belongs to another
+      // extension or tool call. Let it through without ending this session;
+      // the tool call's end cleans up a session the extension walked away from.
       const step = session.resolved?.[stepIndex];
-      if (!step || !stepMatches(step, dialog)) {
-        this.endSession(session);
-        return null;
-      }
+      if (!step || !stepMatches(step, dialog)) return null;
     }
     session.nextStep += 1;
 
@@ -286,7 +301,7 @@ export function emptyQuestionDraft(): QuestionDraft {
 export function draftToAnswer(question: AskUserQuestion, draft: QuestionDraft): AskUserQuestionAnswer | null {
   const text = draft.text.trim();
   if (question.multiSelect) {
-    if (draft.custom) return text ? { kind: "custom", text } : null;
+    if (draft.custom) return text && !isIndexOnlyText(question, text) ? { kind: "custom", text } : null;
     return { kind: "multi", optionIndexes: [...draft.checked].sort((a, b) => a - b) };
   }
   if (draft.custom) return text ? { kind: "custom", text } : null;

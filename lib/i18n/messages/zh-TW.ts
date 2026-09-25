@@ -340,6 +340,7 @@ export const zhTWLocale: LocalePlugin = {
     "chat.questionnaireTypeSomething": "自行輸入。",
     "chat.questionnaireTypePlaceholder": "輸入你的回答",
     "chat.questionnaireMultiHint": "可複選",
+    "chat.questionnaireNumbersOnly": "僅含數字會被當作選項編號。請加上文字，或直接勾選選項。",
     "chat.questionnairePreview": "預覽",
     "chat.questionnaireNext": "下一題",
     "chat.questionnaireBack": "上一題",

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { MarkdownBody } from "./MarkdownBody";
 import { useI18n } from "@/hooks/useI18n";
-import { draftToAnswer, emptyQuestionDraft, type QuestionDraft } from "@/lib/ask-user-question";
+import { draftToAnswer, emptyQuestionDraft, isIndexOnlyText, type QuestionDraft } from "@/lib/ask-user-question";
 import type { AskUserQuestion, AskUserQuestionAnswer, ExtensionUiRequest } from "@/lib/types";
 
 type QuestionnaireRequest = Extract<ExtensionUiRequest, { method: "questionnaire" }>;
@@ -35,10 +35,11 @@ export function AskUserQuestionPanel({
   const answeredCount = answers.filter((answer, index) => answer !== null && isTouched(questions[index], drafts[index])).length;
   const complete = answers.every((answer) => answer !== null);
 
-  const submit = useCallback(() => {
-    if (!answers.every((answer): answer is AskUserQuestionAnswer => answer !== null)) return;
-    onRespond(request, { answers });
-  }, [answers, onRespond, request]);
+  const submit = useCallback((current: QuestionDraft[] = drafts) => {
+    const submitted = questions.map((question, index) => draftToAnswer(question, current[index]));
+    if (!submitted.every((answer): answer is AskUserQuestionAnswer => answer !== null)) return;
+    onRespond(request, { answers: submitted });
+  }, [drafts, onRespond, questions, request]);
   const cancel = useCallback(() => onRespond(request, { cancelled: true }), [onRespond, request]);
 
   const updateDraft = useCallback((index: number, update: (draft: QuestionDraft) => QuestionDraft) => {
@@ -50,13 +51,17 @@ export function AskUserQuestionPanel({
     setPreviewIndex(null);
   }, []);
 
-  const advance = useCallback(() => {
+  /**
+   * `committed` is the draft a keyboard commit just produced. It has not reached
+   * `drafts` yet, so submitting from state alone would send the previous choice.
+   */
+  const advance = useCallback((committed?: QuestionDraft) => {
     if (!multipleQuestions) {
-      submit();
+      submit(committed ? [committed] : drafts);
       return;
     }
     goTo(Math.min(tab + 1, reviewTab));
-  }, [goTo, multipleQuestions, reviewTab, submit, tab]);
+  }, [drafts, goTo, multipleQuestions, reviewTab, submit, tab]);
 
   const title = t("chat.questionnaireTitle");
 
@@ -212,7 +217,7 @@ export function AskUserQuestionPanel({
                 {t("chat.questionnaireNext")}
               </button>
             ) : (
-              <button type="button" onClick={submit} disabled={!complete} style={primaryButtonStyle(complete)}>
+              <button type="button" onClick={() => submit()} disabled={!complete} style={primaryButtonStyle(complete)}>
                 {t("chat.submit")}
               </button>
             )}
@@ -268,7 +273,7 @@ function QuestionView({
   previewIndex: number | null;
   onPreview: (index: number | null) => void;
   onChange: (update: (draft: QuestionDraft) => QuestionDraft) => void;
-  onCommit: () => void;
+  onCommit: (committed?: QuestionDraft) => void;
 }) {
   const { t } = useI18n();
   const listRef = useRef<HTMLDivElement>(null);
@@ -354,11 +359,13 @@ function QuestionView({
               onFocus={() => option.preview && onPreview(index)}
               onChoose={() => choose(index)}
               onCommit={() => {
-                if (question.multiSelect) choose(index);
-                else {
+                if (question.multiSelect) {
                   choose(index);
-                  onCommit();
+                  return;
                 }
+                const committed = { ...draft, selected: index, custom: false };
+                onChange(() => committed);
+                onCommit(committed);
               }}
             />
           ))}
@@ -397,6 +404,11 @@ function QuestionView({
                 fontSize: 13,
               }}
             />
+          )}
+          {draft.custom && question.multiSelect && isIndexOnlyText(question, draft.text) && (
+            <div role="alert" style={{ fontSize: 11, color: "var(--text-dim)" }}>
+              {t("chat.questionnaireNumbersOnly")}
+            </div>
           )}
         </div>
 
