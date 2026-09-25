@@ -96,6 +96,7 @@ app/api/
 
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
+  ask-user-question.ts  bridge from rpiv-ask-user-question's per-question dialogs to one questionnaire form
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
@@ -123,6 +124,7 @@ components/
   MessageView.tsx     renders one message (user/assistant/toolCall/toolResult)
   BranchNavigator.tsx in-session branch switcher
   ChatMinimap.tsx     scroll minimap alongside the message list
+  AskUserQuestionPanel.tsx  questionnaire form for ask_user_question (tabs, options, previews, review)
   MarkdownBody.tsx    markdown renderer
   ModelsConfig.tsx    modal for editing models.json (opened from sidebar bottom)
   EnabledModelsSection.tsx  model switches inside ModelsConfig, backed by enabledModels
@@ -259,6 +261,13 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - `hooks/useAudio.ts` stores the toggle in `localStorage` as `pi-sound-enabled` and reuses one `AudioContext`.
 - Browser autoplay policy means sound must be unlocked from a user gesture; `ChatInput` calls the unlock hook from interactive controls, and `ChatWindow` plays the tone from `onAgentEnd`.
 
+### `ask_user_question` questionnaire
+- `@juicesharp/rpiv-ask-user-question` sees `ctx.mode === "rpc"` in Pi Web, so it skips its terminal overlay and walks the questions with one `select` (plus an `input` after "Type something.") or one multi-select `input` per question. `lib/ask-user-question.ts` recognizes the first dialog of an active `ask_user_question` tool call by its title prefix (`[header] question`) and option count, and emits a single `extension_ui_request` with `method: "questionnaire"` carrying every question, previews included.
+- The browser answers with `{ answers }` on the same `extension_ui_response` command. The bridge then replays those answers into the extension's dialog sequence (option rows by index, multi-select as `"1,3"`, typed text through the follow-up input), so the extension still builds the result envelope the model sees. Cancel returns `{ cancelled: true }` to the first dialog, which the extension reports as declined.
+- On multi-select, "Type something." is a radio that excludes the checkboxes: choosing it clears them and checking any option leaves it. The extension reads any non-index token as one custom answer for the whole question, so ticked options and typed text cannot both reach the model; never fold labels into the typed reply.
+- Any dialog that does not fit the expected sequence is shown as an ordinary dialog and does **not** end the bridge: the extension opens its next dialog only after the previous one is answered, so a mismatch — including any dialog while the panel is still open — is another extension's or a parallel tool call's, and ending there would drop every remaining answer. Sessions end after their last scripted step or on `tool_execution_end`.
+- Typed multi-select text made only of in-range option numbers (`"2"`, `"1 3"`) is refused with a hint (`isIndexOnlyText()`): the extension would read it as a selection, and the reply format has no escape. The questionnaire request goes through `requestExtensionUi()`, so SSE replay, abort, and `extension_ui_closed` behave like every other dialog.
+
 ### Exported session HTML
 - `/api/sessions/[id]/export` delegates to pi's export helper, then patches recursive tree helpers in the generated HTML to iterative versions so very deep linear sessions do not overflow the browser call stack.
 
@@ -291,3 +300,13 @@ Location: `~/.pi/agent/sessions/<encoded-cwd>/<timestamp>_<uuid>.jsonl`
 
 
 
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

@@ -20,6 +20,7 @@ import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
 import type {
+  AskUserQuestionAnswer,
   ExtensionUiRequest,
   ExtensionUiResponse,
   ExtensionWidgetItem,
@@ -27,6 +28,7 @@ import type {
   SessionInfo,
   SessionMessageEntry,
 } from "./types";
+import { ASK_USER_QUESTION_TOOL_NAME, QuestionnaireBridge, type QuestionnaireDialog } from "./ask-user-question";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
 import {
   createSubagentExtension,
@@ -225,6 +227,16 @@ export class AgentSessionWrapper {
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
   private activeCustomUis = new Map<string, ActiveCustomUi>();
+  private questionnaireBridge = new QuestionnaireBridge({
+    getToolCalls: () => Array.from(this.activeToolEvents.values())
+      .filter((event) => event.toolName === ASK_USER_QUESTION_TOOL_NAME && typeof event.toolCallId === "string")
+      .map((event) => ({ toolCallId: event.toolCallId as string, args: event.args })),
+    ask: (toolCallId, questions) => this.requestExtensionUi<AskUserQuestionAnswer[] | undefined>(
+      { method: "questionnaire", toolCallId, questions },
+      undefined,
+      (response) => "answers" in response ? response.answers : undefined,
+    ),
+  });
   private extensionUiAbortController = new AbortController();
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
@@ -324,6 +336,7 @@ export class AgentSessionWrapper {
           this.activeToolEvents.set(toolCallId, event);
         } else if (event.type === "tool_execution_end") {
           this.activeToolEvents.delete(toolCallId);
+          this.questionnaireBridge.finishToolCall(toolCallId);
         }
       }
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
@@ -1023,6 +1036,7 @@ export class AgentSessionWrapper {
     this.pendingUiResponses.clear();
     this.pendingUiRequests.clear();
     this.activeToolEvents.clear();
+    this.questionnaireBridge.clear();
     this.clearExtensionWidgets(false);
 
     const finishDispose = () => {
@@ -1487,9 +1501,18 @@ export class AgentSessionWrapper {
     });
   }
 
+  /**
+   * Answer an `ask_user_question` dialog from the questionnaire panel, if it is one.
+   * The extension walks its questions with one select/input each in rpc mode.
+   */
+  private answerFromQuestionnaire(dialog: QuestionnaireDialog): Promise<string | undefined> | null {
+    const response = this.questionnaireBridge.handleDialog(dialog);
+    return response?.then((value) => "value" in value ? value.value : undefined) ?? null;
+  }
+
   private createExtensionUiContext(): ExtensionUiContextLike {
     return {
-      select: (title, options, opts) => this.requestExtensionUi(
+      select: (title, options, opts) => this.answerFromQuestionnaire({ method: "select", title, options }) ?? this.requestExtensionUi(
         { method: "select", title, options, ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
         undefined,
         (response) => "value" in response ? response.value : undefined,
@@ -1503,7 +1526,7 @@ export class AgentSessionWrapper {
         opts?.timeout,
         opts?.signal,
       ),
-      input: (title, placeholder, opts) => this.requestExtensionUi(
+      input: (title, placeholder, opts) => this.answerFromQuestionnaire({ method: "input", title }) ?? this.requestExtensionUi(
         { method: "input", title, ...(placeholder !== undefined ? { placeholder } : {}), ...(opts?.timeout ? { timeout: opts.timeout } : {}) },
         undefined,
         (response) => "value" in response ? response.value : undefined,
