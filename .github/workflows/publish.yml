@@ -1,0 +1,42 @@
+name: Publish
+
+# Publishes @praveenc/pi-web to npmjs when a vX.Y.Z tag is pushed.
+# Uses npm trusted publishing (OIDC), so no npm token is stored in the repo.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24 bundles npm 11, which trusted publishing requires.
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      # Only stable versions are published; a prerelease would take the latest dist-tag.
+      - name: Tag must be a stable version matching package.json
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "v$(node -p 'require("./package.json").version')" = "$TAG"
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run build
+      - run: npm publish
