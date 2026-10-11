@@ -36,7 +36,17 @@ npm install -g @praveenc/pi-web@latest
 pi-web
 ```
 
-Для обновления остановите запущенный процесс с помощью `Ctrl+C` и повторите ту же команду установки. Для удаления выполните `npm uninstall -g @praveenc/pi-web`.
+Команды:
+
+```bash
+pi-web version          # вывести установленную версию
+pi-web status           # список запущенных серверов
+pi-web stop [--port N]  # остановить запущенный сервер
+pi-web open [--port N]  # открыть запущенный сервер в браузере
+pi-web update [--check] # обновить глобальную установку npm
+```
+
+Для обновления выполните `pi-web stop`, затем `pi-web update` (или повторите ту же команду установки). Для удаления выполните `npm uninstall -g @praveenc/pi-web`.
 
 ## Настройка
 
