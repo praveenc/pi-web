@@ -89,12 +89,22 @@ try {
     await rose.press("ArrowRight");
     await expectTheme("dark");
     assert.equal(await page.getByRole("radio", { name: "Dark", exact: true }).isChecked(), true);
-    const cobaltzIcons = await Promise.all(["CobaltZ", "CobaltZ Light"].map((name) =>
-      page.getByRole("radio", { name, exact: true }).locator("..").locator(".settings-theme-glyph").innerHTML()));
-    assert.equal(cobaltzIcons[0], cobaltzIcons[1], "Both CobaltZ variants share the bolt icon");
+    // System wraps back to the last swatches: CobaltZ, then CobaltZ Light.
+    const system = page.getByRole("radio", { name: "System", exact: true });
+    await system.focus();
+    await system.press("ArrowLeft");
+    await expectTheme("cobaltz");
+    await page.keyboard.press("ArrowLeft");
+    await expectTheme("cobaltz-light");
+    assert.equal(await page.getByRole("radio", { name: "CobaltZ Light", exact: true }).isChecked(), true);
+    const glyphs = page.locator(".settings-theme-glyph");
+    assert.equal(await glyphs.count(), 2, "Only the two CobaltZ swatches carry the bolt");
+    for (const name of ["CobaltZ", "CobaltZ Light"]) {
+      assert.equal(await page.getByRole("radio", { name, exact: true }).locator("..").locator(".settings-theme-glyph").isVisible(), true, `${name} shows the bolt`);
+    }
     await page.keyboard.press("Escape");
     await page.reload();
-    await expectTheme("dark");
+    await expectTheme("cobaltz-light");
     await page.getByText("No sessions found", { exact: true }).waitFor({ state: "attached" });
     if (width === 1440) {
       await page.emulateMedia({ reducedMotion: "no-preference" });
