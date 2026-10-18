@@ -1,18 +1,30 @@
+// Settings shows these as swatches: System, the light row, the dark row, then a row of three:
+// the high-contrast pair and Zenburn, then the CobaltZ pair.
+// The rows line up by hue: each light theme sits above its dark counterpart; Rose and Slate have none.
 export const THEME_OPTIONS = [
-  { id: "light", label: "settings.themeLight" },
-  { id: "dark", label: "settings.themeDark" },
-  { id: "mist", label: "settings.themeMist" },
-  { id: "rose", label: "settings.themeRose" },
-  { id: "pine", label: "settings.themePine" },
-  { id: "cobaltz", label: "settings.themeCobaltz" },
-  { id: "cobaltz-light", label: "settings.themeCobaltzLight" },
-  { id: "auto", label: "settings.themeSystem" },
+  { id: "auto", label: "settings.themeSystem", scheme: null },
+  { id: "light", label: "settings.themeLight", scheme: "light" },
+  { id: "mist", label: "settings.themeMist", scheme: "light" },
+  { id: "lilac", label: "settings.themeLilac", scheme: "light" },
+  { id: "sand", label: "settings.themeSand", scheme: "light" },
+  { id: "rose", label: "settings.themeRose", scheme: "light" },
+  { id: "dark", label: "settings.themeDark", scheme: "dark" },
+  { id: "pine", label: "settings.themePine", scheme: "dark" },
+  { id: "dusk", label: "settings.themeDusk", scheme: "dark" },
+  { id: "ember", label: "settings.themeEmber", scheme: "dark" },
+  { id: "slate", label: "settings.themeSlate", scheme: "dark" },
+  { id: "contrast-light", label: "settings.themeContrastLight", scheme: "light" },
+  { id: "contrast-dark", label: "settings.themeContrastDark", scheme: "dark" },
+  { id: "zenburn", label: "settings.themeZenburn", scheme: "dark" },
+  { id: "cobaltz-light", label: "settings.themeCobaltzLight", scheme: "light" },
+  { id: "cobaltz", label: "settings.themeCobaltz", scheme: "dark" },
 ] as const;
 
 export type ThemePreference = (typeof THEME_OPTIONS)[number]["id"];
 export type ResolvedTheme = Exclude<ThemePreference, "auto">;
 
-const DARK_THEMES: readonly ResolvedTheme[] = ["dark", "pine", "cobaltz"];
+export const LIGHT_THEMES: readonly ResolvedTheme[] = THEME_OPTIONS.flatMap((option) => (option.scheme === "light" ? [option.id] : []));
+export const DARK_THEMES: readonly ResolvedTheme[] = THEME_OPTIONS.flatMap((option) => (option.scheme === "dark" ? [option.id] : []));
 
 export function isThemePreference(value: unknown): value is ThemePreference {
   return THEME_OPTIONS.some((option) => option.id === value);

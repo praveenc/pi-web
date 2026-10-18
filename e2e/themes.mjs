@@ -3,12 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { DARK_THEMES, THEME_OPTIONS } from "../lib/theme.ts";
 
 const base = process.env.E2E_BASE_URL || "http://127.0.0.1:30141";
 const artifacts = fileURLToPath(new URL("../test-results/themes/", import.meta.url));
-const themes = ["light", "dark", "mist", "rose", "pine", "cobaltz", "cobaltz-light", "auto"];
-const labels = ["Light", "Dark", "Mist", "Rose", "Pine", "CobaltZ", "CobaltZ Light", "System"];
-const darkThemes = new Set(["dark", "pine", "cobaltz"]);
+const themes = THEME_OPTIONS.map(({ id }) => id);
+const labels = ["System", "Light", "Mist", "Lilac", "Sand", "Rose", "Dark", "Pine", "Dusk", "Ember", "Slate", "High contrast light", "High contrast dark", "Zenburn", "CobaltZ Light", "CobaltZ"];
 await mkdir(artifacts, { recursive: true });
 const browser = await chromium.launch();
 
@@ -43,8 +43,8 @@ try {
     };
     const expectTheme = async (theme) => {
       await page.waitForFunction((value) => document.documentElement.dataset.theme === value, theme);
-      assert.equal(await page.locator("html").evaluate((root) => root.classList.contains("dark")), darkThemes.has(theme));
-      assert.equal(await page.locator("html").evaluate((root) => getComputedStyle(root).colorScheme), darkThemes.has(theme) ? "dark" : "light");
+      assert.equal(await page.locator("html").evaluate((root) => root.classList.contains("dark")), DARK_THEMES.includes(theme));
+      assert.equal(await page.locator("html").evaluate((root) => getComputedStyle(root).colorScheme), DARK_THEMES.includes(theme) ? "dark" : "light");
     };
     await openSettings();
     for (const [index, theme] of themes.entries()) {
@@ -65,37 +65,43 @@ try {
       for (const background of ["accent", "accent-hover"]) {
         assert.ok(contrast(colors["accent-contrast"], colors[background]) >= 4.5, `${theme}: button contrast`);
       }
-      assert.equal(await page.locator(".settings-theme-option").evaluateAll((options) => options.every((option) => {
-        const label = option.querySelector(".settings-theme-option-label");
-        const box = option.getBoundingClientRect();
-        const text = label.getBoundingClientRect();
-        return option.scrollWidth <= option.clientWidth && text.right <= box.right && text.bottom <= box.bottom;
-      })), true, `Theme labels must fit at ${width}px`);
+      assert.equal(await page.locator(".settings-theme-options").evaluate((group) => {
+        const box = group.getBoundingClientRect();
+        return [...group.querySelectorAll(".settings-theme-name")].every((name) => {
+          const fill = name.parentElement;
+          return name.scrollWidth <= name.clientWidth && name.scrollHeight <= name.clientHeight && fill.getBoundingClientRect().right <= box.right && getComputedStyle(fill).backgroundColor !== "rgba(0, 0, 0, 0)";
+        }) && box.right <= document.documentElement.clientWidth;
+      }), true, `Theme names must fit their swatches at ${width}px`);
       await page.screenshot({ path: `${artifacts}/${theme}-${width}.png`, animations: "disabled" });
       await page.reload();
       await expectTheme(theme === "auto" ? "light" : theme);
       await openSettings();
       assert.equal(await radio.isChecked(), true, "Selection must survive refresh");
     }
+    await page.getByRole("radio", { name: "System", exact: true }).locator("..").click();
     await page.emulateMedia({ colorScheme: "dark" });
     await expectTheme("dark");
     await page.getByRole("radio", { name: "Pine", exact: true }).locator("..").click();
     await page.emulateMedia({ colorScheme: "light" });
     await expectTheme("pine");
-    const light = page.getByRole("radio", { name: "Light", exact: true });
-    await light.focus();
-    await light.press("ArrowRight");
+    const rose = page.getByRole("radio", { name: "Rose", exact: true });
+    await rose.focus();
+    await rose.press("ArrowRight");
     await expectTheme("dark");
     assert.equal(await page.getByRole("radio", { name: "Dark", exact: true }).isChecked(), true);
+    // System wraps back to the last swatches: CobaltZ, then CobaltZ Light.
     const system = page.getByRole("radio", { name: "System", exact: true });
     await system.focus();
     await system.press("ArrowLeft");
+    await expectTheme("cobaltz");
+    await page.keyboard.press("ArrowLeft");
     await expectTheme("cobaltz-light");
     assert.equal(await page.getByRole("radio", { name: "CobaltZ Light", exact: true }).isChecked(), true);
-    assert.equal(await page.locator(".settings-theme-option svg").count(), labels.length);
-    const cobaltzIcons = await Promise.all(["CobaltZ", "CobaltZ Light"].map((name) =>
-      page.getByRole("radio", { name, exact: true }).locator("..").locator("svg").innerHTML()));
-    assert.equal(cobaltzIcons[0], cobaltzIcons[1], "Both CobaltZ variants share the bolt icon");
+    const glyphs = page.locator(".settings-theme-glyph");
+    assert.equal(await glyphs.count(), 2, "Only the two CobaltZ swatches carry the bolt");
+    for (const name of ["CobaltZ", "CobaltZ Light"]) {
+      assert.equal(await page.getByRole("radio", { name, exact: true }).locator("..").locator(".settings-theme-glyph").isVisible(), true, `${name} shows the bolt`);
+    }
     await page.keyboard.press("Escape");
     await page.reload();
     await expectTheme("cobaltz-light");
@@ -115,7 +121,7 @@ try {
       }
     }
     assert.deepEqual(errors, []);
-    console.log(`PASS ${width}px: palettes, contrast, persistence, system preference, keyboard navigation, icons`);
+    console.log(`PASS ${width}px: palettes, contrast, persistence, system preference, keyboard navigation, CobaltZ icons`);
     await context.close();
   }
 } finally {
