@@ -3,11 +3,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
+import { terminalFontSize, useChatAppearance } from "@/hooks/useChatAppearance";
 import { useI18n } from "@/hooks/useI18n";
 import { setTerminalTheme, useTerminalTheme } from "@/hooks/useTerminalTheme";
 import { subscribeFontPreferences } from "@/hooks/useFontPreferences";
 import { readFontWeight } from "@/lib/font-preferences";
 import { createTerminalWriter, terminalRequest } from "@/lib/terminal-client";
+import { pageId, trackEventSource } from "@/lib/page-debug";
 import {
   applyTerminalModifiers,
   NO_TERMINAL_MODIFIERS,
@@ -29,6 +31,12 @@ interface Props {
   onCloseError: () => void;
 }
 
+function shouldAutofocusTerminal() {
+  // On touch devices, let a real tap focus xterm and open the software keyboard.
+  // Programmatic focus can leave iOS focused without showing its keyboard.
+  return window.matchMedia("(pointer: fine)").matches;
+}
+
 export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }: Props) {
   const { t } = useI18n();
   const { id, cwd, restored } = tab;
@@ -48,6 +56,10 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
   const theme = useTerminalTheme();
   const themeRef = useRef(theme);
   themeRef.current = theme;
+  const fontSize = terminalFontSize(useChatAppearance().fontSize);
+  const fontSizeRef = useRef(fontSize);
+  fontSizeRef.current = fontSize;
+  const refitRef = useRef<() => void>(() => {});
 
   const consumeModifiers = useCallback(() => {
     const current = modifiersRef.current;
@@ -78,6 +90,14 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     let connected = false;
     let exited = false;
     let inputFailed = false;
+    // Each connection's first output is history: what the shell printed before this page
+    // connected. xterm answers the questions in it again (cursor position, colours, device
+    // attributes) and the programs that asked have gone, so the shell would take the answers
+    // as typing. Nothing xterm emits is sent while history is being drawn. A shell this panel
+    // just started has had no page yet: it may still be waiting for the answer (fish 4.1+ asks
+    // for the device attributes at startup), so its first output is answered.
+    let awaitingHistory = false;
+    let drawingHistory = 0;
     setStatus("connecting");
     setError(null);
     setExitCode(null);
@@ -93,7 +113,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     const terminal = new Terminal({
       cursorBlink: true,
       ...readTerminalFont(),
-      fontSize: 13,
+      fontSize: fontSizeRef.current,
       lineHeight: 1.25,
       scrollback: 8000,
       screenReaderMode: true,
@@ -121,7 +141,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     });
     writerRef.current = writer;
     const onData = terminal.onData((data) => {
-      if (connected && !exited && !inputFailed) writer.write(applyTerminalModifiers(data, consumeModifiers()));
+      if (connected && !exited && !inputFailed && !drawingHistory) writer.write(applyTerminalModifiers(data, consumeModifiers()));
     });
     const fitAndResize = () => {
       if (!container.offsetWidth || !container.offsetHeight) return;
@@ -131,6 +151,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
       if (!connected || exited || inputFailed) return;
       writer.resize(Math.max(2, cols), Math.max(2, rows));
     });
+    refitRef.current = fitAndResize;
     const resizeObserver = new ResizeObserver(fitAndResize);
     resizeObserver.observe(container);
     const updateFont = () => {
@@ -145,13 +166,23 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
     const connect = () => {
       if (disposed || exited || !navigator.onLine) return;
       events?.close();
-      events = new EventSource(`/api/terminal/${encodeURIComponent(id)}/events${offset === undefined ? "" : `?after=${offset}`}`);
+      // `holder`: the page, for the Debug panel's connected pages.
+      const query = new URLSearchParams({ holder: pageId() });
+      if (offset !== undefined) query.set("after", String(offset));
+      events = trackEventSource("terminal", new EventSource(`/api/terminal/${encodeURIComponent(id)}/events?${query}`), cwd);
       events.onmessage = (message) => {
         const event = JSON.parse(message.data) as TerminalEvent;
         if (event.type === "output") {
+          const history = awaitingHistory;
+          awaitingHistory = false;
           if (event.reset) terminal.reset();
           else if (offset !== undefined && event.offset <= offset) return;
-          terminal.write(event.data);
+          if (history && event.data) {
+            drawingHistory += 1;
+            terminal.write(event.data, () => { drawingHistory -= 1; });
+          } else {
+            terminal.write(event.data);
+          }
           offset = event.offset;
         } else {
           exited = true;
@@ -163,13 +194,15 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
         }
       };
       events.onopen = () => {
+        // Also runs when the browser reconnects the stream by itself.
+        awaitingHistory = restored || reconnectKey > 0 || offset !== undefined;
         connected = true;
         if (inputFailed) return;
         terminal.options.disableStdin = false;
         setStatus("ready");
         fitAndResize();
         writer.resize(Math.max(2, terminal.cols), Math.max(2, terminal.rows));
-        if (container.offsetWidth && container.offsetHeight) terminal.focus();
+        if (shouldAutofocusTerminal() && container.offsetWidth && container.offsetHeight) terminal.focus();
       };
       events.onerror = () => {
         if (disposed || exited) return;
@@ -223,6 +256,7 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
       window.removeEventListener("online", connect);
       terminal.dispose();
       terminalRef.current = null;
+      refitRef.current = () => {};
     };
   }, [id, cwd, restored, reconnectKey, consumeModifiers]);
 
@@ -231,7 +265,15 @@ export function TerminalPanel({ tab, active, onRestart, onClosed, onCloseError }
   }, [theme]);
 
   useEffect(() => {
-    if (active) terminalRef.current?.focus();
+    const terminal = terminalRef.current;
+    if (!terminal || terminal.options.fontSize === fontSize) return;
+    // A refit sends the new cols/rows to the shell through onResize, as a font change does.
+    terminal.options.fontSize = fontSize;
+    refitRef.current();
+  }, [fontSize]);
+
+  useEffect(() => {
+    if (active && shouldAutofocusTerminal()) terminalRef.current?.focus();
   }, [active]);
 
   useEffect(() => {

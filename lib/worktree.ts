@@ -1,8 +1,10 @@
 import { execFile } from "child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, realpath, realpathSync } from "fs";
+import { access } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
 import { promisify } from "util";
 import { allowFileRoot } from "./allowed-roots";
+import { projectGitEnvironment } from "./git-environment";
 import { samePath, toNativePath } from "./paths";
 
 const execFileAsync = promisify(execFile);
@@ -37,7 +39,7 @@ export interface WorktreeInfo {
 
 declare global {
   var __piProjectCache: Map<string, { info: ProjectInfo; expiresAt: number }> | undefined;
-  var __piProjectRefresh: Map<string, Promise<void>> | undefined;
+  var __piProjectRefresh: Map<string, Promise<ProjectInfo>> | undefined;
   var __piProjectCacheGeneration: number | undefined;
 }
 
@@ -60,9 +62,27 @@ async function git(cwd: string, args: string[], timeoutMs = 10_000): Promise<str
     maxBuffer: 1024 * 1024,
     // Pin the message locale so error-text matching (e.g. the dirty-worktree
     // detection in the DELETE route) works regardless of system language.
-    env: { ...process.env, LC_ALL: "C" },
+    env: projectGitEnvironment(),
   });
   return stdout.trim();
+}
+
+/** Spawn failures that clear up on their own: out of fds, processes or memory. */
+const TRANSIENT_SPAWN_CODES = new Set(["EMFILE", "ENFILE", "EAGAIN", "ENOMEM"]);
+
+/**
+ * A git run that never gave its answer: the spawn failed for want of
+ * resources, or git was killed (the timeout). Anything git itself exits with
+ * (outside a repository, at a mount point, dubious ownership, a broken .git)
+ * and a missing git binary are the folder's answer for now, cached like a
+ * resolved repo; caching them also keeps a permanently broken cwd from
+ * spawning git and logging on every session list.
+ */
+function isTransientGitError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const { code, killed, signal } = error as { code?: unknown; killed?: unknown; signal?: unknown };
+  return killed === true || (typeof signal === "string" && signal !== "")
+    || (typeof code === "string" && TRANSIENT_SPAWN_CODES.has(code));
 }
 
 function realPathOrSelf(filePath: string): string {
@@ -92,6 +112,48 @@ function repoRootFromCommonDir(commonDir: string): string {
   return commonDir;
 }
 
+const projectFallback = (cwd: string): ProjectInfo => ({
+  projectRoot: cwd, branch: null, isWorktree: false, isTopLevel: false,
+});
+
+function pathExists(filePath: string): Promise<boolean> {
+  return access(filePath).then(() => true, () => false);
+}
+
+const realpathAsync = promisify(realpath);
+
+// Node's JS realpath, as `realpathSync`: `fs/promises.realpath` is the OS one, which on macOS
+// rewrites a cwd's letter case and on Windows resolves `subst` drives, so a project would
+// group differently from the sync path.
+function realPathOrSelfAsync(filePath: string): Promise<string> {
+  return realpathAsync(filePath).catch(() => filePath);
+}
+
+const inferredRepoChecks = new Map<string, Promise<string | null>>();
+
+function checkInferredRepo(repoRoot: string): Promise<string | null> {
+  const current = inferredRepoChecks.get(repoRoot);
+  if (current) return current;
+  const task = (async () => {
+    const isRepo = await pathExists(join(repoRoot, ".git"))
+      || (await Promise.all(["HEAD", "objects", "refs"].map((name) => pathExists(join(repoRoot, name))))).every(Boolean);
+    return isRepo ? realPathOrSelfAsync(repoRoot) : null;
+  })().finally(() => inferredRepoChecks.delete(repoRoot));
+  inferredRepoChecks.set(repoRoot, task);
+  return task;
+}
+
+async function inferRemovedWorktreeAsync(cwd: string): Promise<ProjectInfo | null> {
+  const repoRoot = removedWorktreeRepo(cwd);
+  const projectRoot = repoRoot && await checkInferredRepo(repoRoot);
+  return projectRoot ? { projectRoot, branch: basename(cwd), isWorktree: true, isTopLevel: true } : null;
+}
+
+function removedWorktreeRepo(cwd: string): string | null {
+  const parent = dirname(cwd);
+  return parent.endsWith("-worktrees") ? parent.slice(0, -"-worktrees".length) || null : null;
+}
+
 /**
  * addWorktree() places worktrees in `<repoRoot>-worktrees/<dir>`. When such a
  * directory no longer exists (worktree removed), group its sessions back
@@ -103,12 +165,11 @@ function repoRootFromCommonDir(commonDir: string): string {
  * deletes the directory *and* its admin entry, so nothing survives to ask. It names one
  * folder and nothing else — the parent of the cwd with a `-worktrees` suffix stripped.
  * `/api/models`, which answers *for* such a cwd, takes the repo as just another cwd and
- * re-checks it against the allowed roots itself.
+ * re-checks it against the allowed roots itself. `resolveProject()` asks the same
+ * question without blocking (`inferRemovedWorktreeAsync()`).
  */
 export function inferRemovedWorktree(cwd: string): ProjectInfo | null {
-  const parent = dirname(cwd);
-  if (!parent.endsWith("-worktrees")) return null;
-  const repoRoot = parent.slice(0, -"-worktrees".length);
+  const repoRoot = removedWorktreeRepo(cwd);
   if (!repoRoot) return null;
   // A bare clone has no `.git`; git takes HEAD, objects/ and refs/ for a git dir.
   const isRepo = existsSync(join(repoRoot, ".git"))
@@ -124,8 +185,12 @@ export function inferRemovedWorktree(cwd: string): ProjectInfo | null {
  * that the stale value is still returned immediately while a background
  * refresh re-runs git; callers (chiefly the session list, which fans out over
  * every project cwd) therefore never wait on git subprocesses once a cwd has
- * been resolved once. Concurrent refreshes for the same cwd share one promise.
+ * been resolved once. Concurrent lookups for the same cwd, cold or stale, share one promise.
  * add/removeWorktree invalidate eagerly via invalidateProjectCache().
+ *
+ * Transient git failures are the exception: the caller gets a cwd-only
+ * fallback for that request only, never cached, so a failing git cannot pin
+ * a phantom project identity (and the error is logged).
  */
 export async function resolveProject(cwd: string): Promise<ProjectInfo> {
   const cache = getProjectCache();
@@ -133,40 +198,45 @@ export async function resolveProject(cwd: string): Promise<ProjectInfo> {
   const now = Date.now();
   if (cached && cached.expiresAt > now) return cached.info;
 
-  // Serve the stale entry now; refresh out of band.
+  const task = refreshProject(cwd);
   if (cached) {
-    refreshProjectInBackground(cwd);
+    void task.catch(() => undefined);
     return cached.info;
   }
 
-  const info = await resolveProjectUncached(cwd);
-  cache.set(cwd, { info, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
-  return info;
+  try {
+    return await task;
+  } catch (error) {
+    // A transient failure must not pin a phantom project identity.
+    console.error(`[pi-web] resolveProject: git failed for ${cwd}, not cached: ${error instanceof Error ? error.message : String(error)}`);
+    return projectFallback(cwd);
+  }
 }
 
-function refreshProjectInBackground(cwd: string): void {
-  const inflight = (globalThis.__piProjectRefresh ??= new Map<string, Promise<void>>());
-  if (inflight.has(cwd)) return;
+function refreshProject(cwd: string): Promise<ProjectInfo> {
+  const inflight = (globalThis.__piProjectRefresh ??= new Map<string, Promise<ProjectInfo>>());
+  const current = inflight.get(cwd);
+  if (current) return current;
   const generation = globalThis.__piProjectCacheGeneration ?? 0;
   const task = resolveProjectUncached(cwd)
     .then((info) => {
-      if ((globalThis.__piProjectCacheGeneration ?? 0) !== generation) return;
-      getProjectCache().set(cwd, { info, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
-    })
-    .catch(() => {
-      // Keep the stale entry on refresh failure; the next TTL window retries.
+      if ((globalThis.__piProjectCacheGeneration ?? 0) === generation) {
+        getProjectCache().set(cwd, { info, expiresAt: Date.now() + PROJECT_CACHE_TTL_MS });
+      }
+      return info;
     })
     .finally(() => {
       if (inflight.get(cwd) === task) inflight.delete(cwd);
     });
   inflight.set(cwd, task);
+  return task;
 }
 
 async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
   let info: ProjectInfo;
   try {
-    if (!existsSync(cwd)) {
-      return inferRemovedWorktree(cwd) ?? { projectRoot: cwd, branch: null, isWorktree: false, isTopLevel: false };
+    if (!await pathExists(cwd)) {
+      return (await inferRemovedWorktreeAsync(cwd)) ?? projectFallback(cwd);
     }
     const out = await git(cwd, [
       "rev-parse", "--path-format=absolute",
@@ -178,7 +248,7 @@ async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
     // keep its forward slashes (`feature/foo`).
     const [commonDir, gitDir, toplevel] = [commonDirRaw, gitDirRaw, toplevelRaw].map(toNativePath);
     // git prints resolved (symlink-free) paths; normalize cwd the same way
-    const realCwd = realPathOrSelf(cwd);
+    const realCwd = await realPathOrSelfAsync(cwd);
     // For a linked worktree, --git-dir differs from --git-common-dir.
     // Only collapse *worktree toplevels* into the main repo. A session whose
     // cwd is a subdirectory of a repo keeps its own project identity —
@@ -190,13 +260,16 @@ async function resolveProjectUncached(cwd: string): Promise<ProjectInfo> {
     const isWorktreeTopLevel = !samePath(gitDir, commonDir) && isTopLevel;
     const topLevelProjectRoot = isWorktreeTopLevel ? repoRootFromCommonDir(commonDir) : toplevel;
     info = {
-      projectRoot: isTopLevel ? realPathOrSelf(topLevelProjectRoot) : cwd,
+      projectRoot: isTopLevel ? await realPathOrSelfAsync(topLevelProjectRoot) : cwd,
       branch: ref && ref !== "HEAD" ? ref : null,
       isWorktree: isWorktreeTopLevel,
       isTopLevel,
     };
-  } catch {
-    info = { projectRoot: cwd, branch: null, isWorktree: false, isTopLevel: false };
+  } catch (error) {
+    // A transient failure propagates so resolveProject keeps it out of the
+    // cache; whatever git itself answered is this folder's identity for now.
+    if (isTransientGitError(error)) throw error;
+    info = projectFallback(cwd);
   }
 
   return info;
@@ -216,23 +289,19 @@ async function getRepoRoot(cwd: string): Promise<string> {
   return realPathOrSelf(repoRootFromCommonDir(toNativePath(commonDir)));
 }
 
-export async function listWorktrees(cwd: string): Promise<WorktreeInfo[]> {
+/** Every worktree git has registered, `missing` when it is prunable or its folder is gone. */
+async function listRegisteredWorktrees(cwd: string): Promise<{ path: string; branch: string | null; missing: boolean }[]> {
   const out = await git(cwd, ["worktree", "list", "--porcelain"]);
-  const worktrees: WorktreeInfo[] = [];
-  let current: (Partial<WorktreeInfo> & { prunable?: boolean }) | null = null;
+  const worktrees: { path: string; branch: string | null; missing: boolean }[] = [];
+  let current: { path: string; branch?: string; prunable?: boolean } | null = null;
 
   const flush = () => {
     if (current?.path) {
-      // Prunable worktrees point at missing/broken gitdirs and cannot be
-      // browsed or selected usefully. Also skip vanished paths even if git has
-      // not marked them prunable yet.
-      if (!current.prunable && existsSync(current.path)) {
-        worktrees.push({
-          path: current.path,
-          branch: current.branch ?? null,
-          isMain: worktrees.length === 0,
-        });
-      }
+      worktrees.push({
+        path: current.path,
+        branch: current.branch ?? null,
+        missing: current.prunable === true || !existsSync(current.path),
+      });
     }
     current = null;
   };
@@ -253,6 +322,15 @@ export async function listWorktrees(cwd: string): Promise<WorktreeInfo[]> {
   return worktrees;
 }
 
+export async function listWorktrees(cwd: string): Promise<WorktreeInfo[]> {
+  // Prunable worktrees point at missing/broken gitdirs and cannot be browsed
+  // or selected usefully. Also skip vanished paths even if git has not marked
+  // them prunable yet.
+  return (await listRegisteredWorktrees(cwd))
+    .filter((worktree) => !worktree.missing)
+    .map(({ path, branch }, index) => ({ path, branch, isMain: index === 0 }));
+}
+
 function findWorktreeByPath(worktrees: readonly WorktreeInfo[], candidate: string): WorktreeInfo | undefined {
   return worktrees.find((worktree) => samePath(worktree.path, candidate));
 }
@@ -265,6 +343,19 @@ function sanitizeBranchForDir(branch: string): string {
   return branch.replace(/[\/\\:*?"<>|\s]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+/**
+ * A branch git will not check out twice: it is the branch of another worktree.
+ * `missing`: that worktree's folder is gone, and git keeps the branch until
+ * `git worktree prune` clears the entry (never run here).
+ */
+export class WorktreeBranchInUseError extends Error {
+  constructor(readonly branch: string, readonly worktreePath: string, readonly missing: boolean) {
+    super(missing
+      ? `Branch '${branch}' belongs to a worktree whose folder is gone: ${worktreePath}; git worktree prune clears it`
+      : `Branch '${branch}' is already checked out at ${worktreePath}`);
+  }
+}
+
 export async function addWorktree(cwd: string, branch: string): Promise<{ path: string; branch: string }> {
   const trimmed = branch.trim();
   if (!trimmed) throw new Error("Branch name is required");
@@ -273,6 +364,11 @@ export async function addWorktree(cwd: string, branch: string): Promise<{ path: 
   if (!dirName) throw new Error(`Invalid branch name: ${branch}`);
 
   const repoRoot = await getRepoRoot(cwd);
+  // Before the folder check: a branch pi-web already made a worktree for also
+  // has its folder, and the answer is where that checkout is, not the folder.
+  // Missing entries too: a deleted folder's entry still holds the branch.
+  const holder = (await listRegisteredWorktrees(repoRoot)).find((worktree) => worktree.branch === trimmed);
+  if (holder) throw new WorktreeBranchInUseError(trimmed, holder.path, holder.missing);
   const baseDir = `${resolve(repoRoot)}-worktrees`;
   const worktreePath = join(baseDir, dirName);
   if (existsSync(worktreePath)) {

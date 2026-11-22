@@ -164,6 +164,10 @@ try {
       await run("printf '\\nTHEME:%s:%s\\n' \"$PR695_TOKEN\" \"$$\"");
       await waitOutput(`THEME:alive:${pid}`);
 
+      // A program that asks the terminal a question and reads the answer, as vim does when it starts.
+      await run("printf '\\033[>c'; read -rs -d c -t 5; printf '\\nQUERY:%s\\n' done");
+      await waitOutput("QUERY:done");
+
       await page.reload();
       await ready();
       await expectFontWeight(600);
@@ -173,7 +177,10 @@ try {
       assert.equal(await terminalBackground(), "rgb(17, 19, 24)");
       assert.equal(await page.evaluate(() => localStorage.getItem("pi-web:terminal-theme")), "dark");
       await run("printf '\\nREFRESH:%s:%s\\n' \"$PR695_TOKEN\" \"$$\"");
+      // The history drawn after the reload holds the question asked above. Its answer typed at
+      // the prompt would have joined this command, which then never prints its line.
       await waitOutput(`REFRESH:alive:${pid}`);
+      assert.doesNotMatch(await text(), /0;276;0c/, "replayed history must not type terminal answers at the prompt");
       assert.equal(created.size, 1, "refresh must reconnect, not create");
 
       await context.setOffline(true);
@@ -183,6 +190,32 @@ try {
       await run("printf '\\nRECONNECT:%s:%s\\n' \"$PR695_TOKEN\" \"$$\"");
       await waitOutput(`RECONNECT:alive:${pid}`);
       assert.equal(((await text()).match(new RegExp(`REFRESH:alive:${pid}`, "g")) ?? []).length, 1, "reconnect must not replay delivered output");
+
+      // The chat font size also sets the live terminal's (13px at its default) and refits the PTY.
+      const xtermFontSize = () => page.locator(".terminal-panel:visible .xterm-rows").evaluate((el) => getComputedStyle(el).fontSize);
+      const ptyColumns = async (label) => {
+        await run(`printf '\\n${label}:%s\\n' "$(stty size)"`);
+        await waitOutput(`${label}:[0-9]+ [0-9]+`);
+        return Number((await text()).match(new RegExp(`${label}:\\d+ (\\d+)`))[1]);
+      };
+      assert.equal(await xtermFontSize(), "13px");
+      const columnsBefore = await ptyColumns("COLS_BEFORE");
+      fontConnections.length = 0;
+      page.on("request", trackFontConnections);
+      await hidePanel();
+      await showSidebar();
+      await page.getByRole("button", { name: "Settings", exact: true }).click();
+      await page.getByRole("slider", { name: "Chat & terminal font size", exact: true }).fill("18");
+      await page.keyboard.press("Escape");
+      if (viewport.width <= 640) {
+        await page.locator(".sidebar-overlay-backdrop").click({ position: { x: viewport.width - 5, y: 100 } });
+      }
+      await showPanel();
+      await ready();
+      assert.equal(await xtermFontSize(), "17px");
+      assert.ok(await ptyColumns("COLS_AFTER") < columnsBefore, "A larger font must refit the PTY to fewer columns");
+      page.off("request", trackFontConnections);
+      assert.deepEqual(fontConnections, [], "A font size change must not recreate the terminal or reconnect its stream");
 
       await page.screenshot({ path: join(artifacts, `${viewport.width}.png`), fullPage: true });
       const dimensions = await page.locator(".terminal-panel:visible").evaluate((element) => {

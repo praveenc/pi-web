@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { jsonResponse } from "@/lib/json-response";
 import {
   attachSessionProjectInfo,
   getSessionListVersion,
@@ -12,6 +11,7 @@ import {
   getCompletionNotificationSuppressedRpcSessionIds,
   getRpcSessionInfos,
   getRunningRpcSessionIds,
+  withSubagentDisplayStatus,
 } from "@/lib/rpc-manager";
 import { startServerPerf } from "@/lib/perf";
 
@@ -36,9 +36,8 @@ export async function GET(req: Request) {
       attachSessionProjectInfo(getRpcSessionInfos()),
     ]);
     perf?.span("scan+projects");
-    const sessions = mergeSessionLists(persistedSessions, runtimeSessions);
-    return perf?.attach(jsonResponse(
-      req,
+    const sessions = withSubagentDisplayStatus(mergeSessionLists(persistedSessions, runtimeSessions));
+    return perf?.attach(NextResponse.json(
       {
         sessions,
         sessionListVersion,
@@ -47,8 +46,7 @@ export async function GET(req: Request) {
         completionNotificationSuppressedSessionIds: getCompletionNotificationSuppressedRpcSessionIds(),
       },
       { headers: { "Cache-Control": "no-store" } },
-    )) ?? jsonResponse(
-      req,
+    )) ?? NextResponse.json(
       {
         sessions,
         sessionListVersion,

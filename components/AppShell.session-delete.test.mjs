@@ -56,6 +56,23 @@ function runHandleSessionDeleted(capturedSelectedSession, active) {
   return state;
 }
 
+test("an extension's session end leaves the session and closes only its panel", () => {
+  assert.match(source, /onSessionEnded=\{handleSessionEnded\}/);
+  const start = source.indexOf("  const handleSessionEnded = useCallback");
+  const end = source.indexOf("  // The Agents switcher's Delete", start);
+  const state = { deleted: [], closed: [] };
+  const context = vm.createContext({
+    useCallback: (callback) => callback,
+    handleSessionDeleted: (id) => state.deleted.push(id),
+    handleCloseFileTab: (id) => state.closed.push(id),
+  });
+  vm.runInContext(stripTypeScriptTypes(`${source.slice(start, end)}
+    handleSessionEnded("side-session");
+  `), context);
+  assert.deepEqual(state.deleted, ["side-session"]);
+  assert.deepEqual(state.closed, ["agent:side-session"]);
+});
+
 test("a delete completing after the user navigated away keeps the new chat", () => {
   const deleting = { id: "gone-session", cwd: "/project-a", projectKey: "/project-a" };
   const navigatedTo = { id: "next-session", cwd: "/project-b", projectKey: "/project-b" };
@@ -77,4 +94,27 @@ test("a delete completing while the user is still on it falls back to the empty 
   assert.ok(state.newSessionDraftId);
   assert.equal(state.sessionKey, 1, "chat remounts as a fresh composer");
   assert.equal(state.routerReplaced, `?cwd=${encodeURIComponent("/project-a")}`);
+});
+
+test("a side chat's stored draft goes only once its delete succeeded", async () => {
+  const start = source.indexOf("  const handleDeleteSideChat = useCallback");
+  const end = source.indexOf("\n  }, [", start);
+  assert.notEqual(start, -1, "handleDeleteSideChat callback not found");
+  for (const refusal of [null, { error: "HTTP 500" }]) {
+    const cleared = [];
+    const context = vm.createContext({
+      useCallback: (callback) => callback,
+      deleteSideChat: async () => refusal,
+      clearDraft: (id) => cleared.push(id),
+      handleCloseFileTab() {},
+      selectedSessionRef: { current: null },
+      handleSelectSession() {},
+      setRefreshKey() {},
+      handleSessionDeleted() {},
+    });
+    const handleDeleteSideChat = vm.runInContext(stripTypeScriptTypes(`${source.slice(start, end)}\n  }, []);\nhandleDeleteSideChat`), context);
+    const error = await handleDeleteSideChat("side-chat", { id: "main" });
+    assert.equal(error, refusal?.error ?? null);
+    assert.deepEqual(cleared, refusal ? [] : ["side-chat"]);
+  }
 });

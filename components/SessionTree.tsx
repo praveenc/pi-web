@@ -63,8 +63,9 @@ type SessionRow = Extract<SidebarRow, { kind: "session" }>;
 
 /**
  * A request to bring one row into view, made by the parent after a change
- * that puts it somewhere the user is not looking (a fork's new row, a moved
- * group). Until it is handled the row is kept mounted. It is handled once:
+ * that puts it somewhere the user may not be looking (the row of a session
+ * just opened, however it was opened; a moved group). Until it is handled
+ * the row is kept mounted. It is handled once:
  * scrolled to when its row is in the rows, or dropped (revealStep(): its row
  * missed REVEAL_MAX_MISSES rows updates, or it is older than
  * REVEAL_EXPIRY_MS), so it never fires later, when that row shows up for
@@ -80,8 +81,12 @@ export interface SessionTreeReveal {
   at: number;
   /** Any row's key: a session row, a group header. */
   rowKey: string;
-  /** "start": the row goes to the top (a group header with its rows below it); else centred when out of view. */
-  block?: "start";
+  /**
+   * "start": the row goes to the top (a group header with its rows below it);
+   * "nearest": a row partly in view scrolls only as far as it takes to show
+   * it whole; else centred when out of view (revealScrollTop()).
+   */
+  block?: "start" | "nearest";
   /**
    * Also focus the row's first control once it is on the page: when focus has
    * fallen to <body>, or when this says the element that has it may give it
@@ -128,6 +133,8 @@ export interface SessionTreeProps {
   /** A group's "+": a new session in that project at once. */
   onGroupNew(project: SidebarProject): void;
   onGroupMenu(project: SidebarProject, opener: HTMLElement): void;
+  /** An unpinned empty group's "Pin to keep": without sessions, only a pin keeps it listed. */
+  onPinEmptyGroup(project: SidebarProject): void;
   /** An archive header's toggle; `all` (Alt+click): every archive group follows this one. */
   onToggleArchiveGroup?(projectKey: string, all: boolean): void;
   /** An archive header's ⋯: Restore all, Delete…. */
@@ -391,7 +398,7 @@ export function SessionTree(props: SessionTreeProps): ReactNode {
     }
   }, [visibleIndices]);
 
-  const hasTreeRows = rows.some((row) => row.kind === "session" || row.kind === "group");
+  const hasTreeRows = rows.some((row) => row.kind === "session" || row.kind === "group" || row.kind === "archive-group");
   const showEmpty = !loading && !error && emptyLabel !== null && !hasTreeRows;
   // While dragging: the group's block is dimmed in place (groups never fold
   // up under the pointer), a line marks the drop, and a pill with the
@@ -579,9 +586,10 @@ const SessionRowView = memo(function SessionRowView({
   const tooltip = `${title}\n${details} · ${formatRelativeTime(root.modified, locale, nowDate)}${branch ? ` · ⑂ ${branch}` : ""}`;
 
   // The right column says the one thing worth knowing: awaiting input, else
-  // running, else unread, else when (a pinned row names its project instead, an
-  // archived row says when it was archived). Nothing sits before the title, so it
-  // gets the room.
+  // running, else unread, else when (a pinned row names its project instead).
+  // An archived row shows its family's time like every row, never the archive
+  // time: an old session archived today read as "just now" (#1351).
+  // Nothing sits before the title, so it gets the room.
   let meta: ReactNode;
   let metaState = "";
   let metaTitle: string | undefined;
@@ -602,8 +610,6 @@ const SessionRowView = memo(function SessionRowView({
     metaTitle = t("sidebar.newActivity");
   } else if (context === "pinned") {
     meta = <span className="session-tree-project">{row.project.name}</span>;
-  } else if (context === "archive" && row.archivedAt !== null) {
-    meta = formatShortRelativeTime(new Date(row.archivedAt), locale, nowDate);
   } else {
     meta = formatShortRelativeTime(family.latestModified, locale, nowDate);
   }
@@ -774,7 +780,8 @@ function RenameInput({
   );
 }
 
-function DeleteConfirm({
+/** A row's delete confirmation; also a side chat's in the Agents switcher (AgentSessionPanel). */
+export function DeleteConfirm({
   label,
   deleteLabel,
   cancelLabel,
@@ -811,11 +818,12 @@ function DeleteConfirm({
 }
 
 /**
- * Spinner + count and dot + count; the label carries the count for screen
- * readers. Also a project's badge in the project menus (ProjectWorktreePicker).
+ * Spinner + count, amber dot + count (awaiting input) and dot + count; the
+ * label carries the count for screen readers. Also a project's badge in the
+ * project menus (ProjectWorktreePicker), which counts no awaiting.
  */
-export function ActivitySummary({ running, unread, t }: { running: number; unread: number; t: (key: string) => string }) {
-  if (running === 0 && unread === 0) return null;
+export function ActivitySummary({ running, awaiting = 0, unread, t }: { running: number; awaiting?: number; unread: number; t: (key: string) => string }) {
+  if (running === 0 && awaiting === 0 && unread === 0) return null;
   return (
     <span className="session-tree-summary">
       {running > 0 && (
@@ -827,6 +835,17 @@ export function ActivitySummary({ running, unread, t }: { running: number; unrea
         >
           <SpinnerIcon size={10} />
           {running}
+        </span>
+      )}
+      {awaiting > 0 && (
+        <span
+          className="session-tree-summary-awaiting"
+          role="img"
+          title={t("sidebar.agentAwaitingInput")}
+          aria-label={`${t("sidebar.agentAwaitingInput")} (${awaiting})`}
+        >
+          <span className="session-tree-summary-dot is-awaiting" />
+          {awaiting}
         </span>
       )}
       {unread > 0 && (
@@ -929,7 +948,7 @@ const GroupRowView = memo(function GroupRowView({
         <ChevronIcon size={12} strokeWidth={3} className={`session-tree-chevron${expanded ? " is-open" : ""}`} />
         <span className="session-tree-group-name">{project.name}</span>
         {project.pinned && <PinIcon size={10} className="session-tree-group-pin" label={t("sidebar.pinnedProject")} />}
-        {!expanded && <ActivitySummary running={row.running} unread={row.unread} t={t} />}
+        {!expanded && <ActivitySummary running={row.running} awaiting={row.awaiting} unread={row.unread} t={t} />}
       </button>
       <span className="session-tree-group-actions">
         <button
@@ -1001,6 +1020,14 @@ const PlainRowView = memo(function PlainRowView({
                 aria-label={`${t("sidebar.agentRunning")} (${row.running})`}
               />
             )}
+            {row.collapsed && row.awaiting > 0 && (
+              <span
+                className="session-tree-pinned-dot is-awaiting"
+                role="img"
+                title={t("sidebar.agentAwaitingInput")}
+                aria-label={`${t("sidebar.agentAwaitingInput")} (${row.awaiting})`}
+              />
+            )}
             {row.collapsed && row.unread > 0 && (
               <span
                 className="session-tree-pinned-dot is-unread"
@@ -1043,7 +1070,16 @@ const PlainRowView = memo(function PlainRowView({
     case "group-empty":
       return (
         <div className="session-tree-row session-tree-group-empty" style={style} data-row-key={row.key}>
-          {t("sidebar.noLiveSessions")}
+          <span className="session-tree-group-empty-label">{t("sidebar.noLiveSessions")}</span>
+          {!row.project.pinned && (
+            <button
+              type="button"
+              className="session-tree-more-toggle"
+              onClick={() => handlers.current.onPinEmptyGroup(row.project)}
+            >
+              {t("sidebar.pinToKeep")}
+            </button>
+          )}
         </div>
       );
     case "footer-open":

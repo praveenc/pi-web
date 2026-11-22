@@ -7,19 +7,26 @@ export interface DiscoveredModel {
   // Capabilities the upstream list publishes, as models.json fields (#856).
   reasoning?: true;
   thinkingLevelMap?: Partial<Record<EffortLevel, string | null>>;
+  input?: string[];
   contextWindow?: number;
   maxTokens?: number;
 }
 
 // Only fields whose meaning does not vary between gateways. `max_tokens` is
 // left out: LiteLLM, for one, fills it with either the input or output limit.
+// So is `pricing`: Vercel AI Gateway quotes `input` per token, Chutes quotes
+// `prompt` per million.
 const CONTEXT_WINDOW_FIELDS = [
   "context_length", "contextLength", "context_window", "contextWindow",
   "max_model_len", "max_input_tokens", "inputTokenLimit",
 ];
 const MAX_TOKENS_FIELDS = ["max_output_tokens", "maxOutputTokens", "max_completion_tokens", "outputTokenLimit"];
 const REASONING_FIELDS = ["supports_reasoning", "supportsReasoning", "reasoning", "thinking"];
-const EFFORT_LIST_FIELDS = ["supported_efforts", "supportedEfforts"];
+// Every spelling of the effort list; the first one that is an array wins.
+const EFFORT_LIST_FIELDS = ["supported_efforts", "supportedEfforts", "reasoning_levels"];
+
+// pi's models.json accepts `text` and `image`; a gateway may advertise more.
+const INPUT_MODALITIES = new Set(["text", "image"]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -39,11 +46,31 @@ function firstPositiveInteger(value: Record<string, unknown>, fields: readonly s
 }
 
 /**
+ * `modalities.input` (models.dev and pi's own metadata) or a bare `input` array
+ * names what the model takes. Only the modalities pi knows survive; a list
+ * naming none of them says nothing, and `["image"]` is kept as advertised —
+ * guessing `text` back in would override what the gateway said.
+ */
+function inputFromValue(value: Record<string, unknown>): string[] | undefined {
+  const modalities = value.modalities;
+  const list = isRecord(modalities) && Array.isArray(modalities.input)
+    ? modalities.input
+    : Array.isArray(value.input) ? value.input : undefined;
+  if (!list) return undefined;
+  const input = Array.from(new Set(list
+    .filter((entry): entry is string => typeof entry === "string")
+    .map((entry) => entry.trim().toLocaleLowerCase())
+    .filter((entry) => INPUT_MODALITIES.has(entry))));
+  return input.length ? input : undefined;
+}
+
+/**
  * An advertised effort list names pi's own levels, which pi sends as the
  * effort when thinkingLevelMap has no entry. Every level it leaves out is
  * marked unsupported (null), and `xhigh` / `max` need an entry to be offered at
- * all. `off` stays unmapped: the list does not say whether thinking can be
- * turned off. A list naming none of pi's levels maps nothing.
+ * all. `off` stays unmapped even when the list names `none`: the list names an
+ * effort string, not whether pi should treat that string as disabled thinking.
+ * A list naming none of pi's levels maps nothing.
  */
 function thinkingLevelMapFromEfforts(value: Record<string, unknown>): DiscoveredModel["thinkingLevelMap"] {
   const list = EFFORT_LIST_FIELDS.map((field) => value[field]).find(Array.isArray);
@@ -61,11 +88,13 @@ function thinkingLevelMapFromEfforts(value: Record<string, unknown>): Discovered
 function capabilitiesFromValue(value: Record<string, unknown>): Omit<DiscoveredModel, "id" | "name"> {
   const reasoning = REASONING_FIELDS.some((field) => value[field] === true);
   const thinkingLevelMap = reasoning ? thinkingLevelMapFromEfforts(value) : undefined;
+  const input = inputFromValue(value);
   const contextWindow = firstPositiveInteger(value, CONTEXT_WINDOW_FIELDS);
   const maxTokens = firstPositiveInteger(value, MAX_TOKENS_FIELDS);
   return {
     ...(reasoning ? { reasoning: true } : {}),
     ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+    ...(input ? { input } : {}),
     ...(contextWindow ? { contextWindow } : {}),
     ...(maxTokens ? { maxTokens } : {}),
   };
@@ -114,6 +143,11 @@ export function parseDiscoveredModels(value: unknown): DiscoveredModel[] {
   }));
 }
 
+// A Google base URL's own API version (`/v1`, `/v1beta`, `/v1alpha`, `/v1beta1`):
+// pi sends Google requests under the base URL as given (apiVersion ""), so the
+// model list is there too. Anthropic's SDK adds `/v1` to its base URL itself.
+const GOOGLE_API_VERSION_SEGMENT = /\/v\d+(?:(?:alpha|beta)\d*)?$/i;
+
 export function buildModelsListUrl(baseUrl: string, api: string): URL {
   const url = new URL(baseUrl.trim());
   const trimmedPath = url.pathname.replace(/\/+$/, "");
@@ -121,7 +155,7 @@ export function buildModelsListUrl(baseUrl: string, api: string): URL {
   if (!/\/models$/i.test(trimmedPath)) {
     let path = trimmedPath;
     if (api === "anthropic-messages" && !/\/v\d+(?:beta)?$/i.test(path)) path += "/v1";
-    if (api === "google-generative-ai" && !/\/v\d+(?:beta)?$/i.test(path)) path += "/v1beta";
+    if (api === "google-generative-ai" && !GOOGLE_API_VERSION_SEGMENT.test(path)) path += "/v1beta";
     url.pathname = `${path}/models`.replace(/\/+/g, "/");
   }
 

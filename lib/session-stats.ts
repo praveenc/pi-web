@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentUsage, SessionEntry, SessionMessage } from "./types";
+import type { AgentMessage, AgentUsage, SessionContext, SessionEntry, SessionMessage } from "./types";
 
 export interface SessionFileStats {
   userMessages: number;
@@ -16,6 +16,9 @@ export interface SessionFileStats {
   cost: number;
 }
 
+/** Most session ids one POST /api/sessions/stats takes; the agent switcher sends a larger family in batches. */
+export const MAX_SESSION_STATS_IDS = 200;
+
 /** One session's totals for the agent switcher (POST /api/sessions/stats). */
 export interface SessionUsageSummary {
   tokens: SessionFileStats["tokens"];
@@ -23,6 +26,9 @@ export interface SessionUsageSummary {
   toolCalls: number;
   /** Estimated active time across all entries, as the stats popover shows it. */
   totalActiveMs: number;
+  /** Recorded settings of this session's active branch, not its profile defaults. */
+  model?: SessionContext["model"];
+  thinkingLevel?: string;
 }
 
 function emptyStats(): SessionFileStats {
