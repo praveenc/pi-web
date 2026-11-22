@@ -1,10 +1,13 @@
 "use client";
 
-import { useState, useEffect, useCallback, useId, useRef } from "react";
+import { LLAMA_CPP_PROVIDER_ID } from "@/lib/provider-listing";
+import { useState, useEffect, useCallback, useId, useRef, type ButtonHTMLAttributes, type DragEvent } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import type { ModelCatalogPreset, ModelCatalogRecommendation } from "@/lib/model-catalog";
 import type { DiscoveredModel } from "@/lib/model-discovery";
 import { ContextWindowError, normalizeContextWindowOverrides, withContextWindowOverride } from "@/lib/model-context";
+import { checkProviderEntries, ProviderEntryError, type ProviderEntryProblem } from "@/lib/model-provider-check";
+import { checkImageMaxBytes, DEFAULT_IMAGE_MAX_BYTES, formatImageBytes, ImageMaxBytesError, imageMaxBytes, parseImageMaxBytes, withImageMaxBytes } from "@/lib/model-image-limits";
 import type { ModelContextSettings } from "./ModelContextWindow";
 import {
   getLastSettingsSelection,
@@ -13,17 +16,29 @@ import {
 import {
   hasModelCostDraftValue,
   modelCostToDraft,
+  modelDropIndex,
+  modelSidebarLabel,
+  moveModelEntry,
   parseCompleteModelCost,
+  providerRuntimeName,
+  providerSidebarLabel,
+  providerMatchesSearch,
   savedModelIds,
+  savedProviderNames,
   serializeHeaderRows,
   setCompatBool,
+  setCompatFlag,
+  setProviderDisplayName,
+  sortModelEntries,
   trackAddedModels,
   collectModelRenames,
+  deleteProviderEntry,
   renameProviderEntry,
   updateHeaderRow,
   type HeaderRow,
   type ModelCostDraft,
   type ModelCostKey,
+  type ModelOrderChange,
 } from "./models-config-helpers";
 import {
   ConfigButton,
@@ -43,6 +58,7 @@ import {
   ConfigSidebarList,
   ConfigSidebarText,
   ConfigSplitView,
+  useConfigDetailNavigation,
 } from "./SettingsUi";
 import {
   EnabledModelsBanner,
@@ -93,9 +109,11 @@ interface ModelEntry {
   id: string;
   name?: string;
   api?: string;
+  baseUrl?: string;
   reasoning?: boolean;
   thinkingLevelMap?: Record<string, string | null>;
   input?: string[];
+  inputLimits?: Record<string, unknown>;
   contextWindow?: number;
   maxTokens?: number;
   cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; tiers?: unknown };
@@ -104,6 +122,7 @@ interface ModelEntry {
 }
 
 interface ProviderEntry {
+  name?: string;
   baseUrl?: string;
   api?: string;
   apiKey?: string;
@@ -174,7 +193,21 @@ function customSelectionExists(config: ModelsJson, selection: Selection): boolea
   return Boolean(config.providers?.[selection.providerName]?.models?.[selection.index]);
 }
 
+/**
+ * An entry holding only model overrides belongs to its managed provider. An
+ * empty `modelOverrides` overrides nothing and pi refuses it, so that entry
+ * stays a listed custom provider Save can select to be deleted (#1353).
+ */
+function isOverridesOnly(entry: ProviderEntry): boolean {
+  return Object.keys(entry).length === 1 && Object.keys(entry.modelOverrides ?? {}).length > 0;
+}
+
 const API_OPTIONS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"] as const;
+
+const PROVIDER_ENTRY_MESSAGES: Record<ProviderEntryProblem, string> = {
+  empty: "models.providerIncomplete",
+  baseUrl: "models.providerNeedsBaseUrl",
+};
 
 // ── Form field helpers ────────────────────────────────────────────────────────
 
@@ -194,8 +227,8 @@ const inputStyle = {
   boxSizing: "border-box" as const,
 };
 
-function TextInput({ value, onChange, placeholder, mono }: { value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean }) {
-  return <input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+function TextInput({ value, onChange, placeholder, mono, inputMode }: { value: string; onChange: (v: string) => void; placeholder?: string; mono?: boolean; inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"] }) {
+  return <input value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} inputMode={inputMode}
     style={{ ...inputStyle, fontFamily: mono ? "var(--font-mono)" : "inherit" }} />;
 }
 
@@ -207,6 +240,7 @@ function SecretTextInput({
   onKeyDown,
   autoComplete = "off",
   spellCheck = false,
+  enterKeyHint,
   style,
 }: {
   value: string;
@@ -216,6 +250,7 @@ function SecretTextInput({
   onKeyDown?: React.KeyboardEventHandler<HTMLInputElement>;
   autoComplete?: string;
   spellCheck?: boolean;
+  enterKeyHint?: React.HTMLAttributes<HTMLInputElement>["enterKeyHint"];
   style?: React.CSSProperties;
 }) {
   const [visible, setVisible] = useState(false);
@@ -236,6 +271,7 @@ function SecretTextInput({
         style={{ ...inputStyle, paddingRight: 34, fontFamily: mono ? "var(--font-mono)" : "inherit" }}
         autoComplete={autoComplete}
         spellCheck={spellCheck}
+        enterKeyHint={enterKeyHint}
       />
       <button
         type="button"
@@ -277,8 +313,9 @@ function SecretTextInput({
   );
 }
 
-function NumInput({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
-  return <input type="number" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} style={inputStyle} />;
+function NumInput({ value, onChange, placeholder, invalid }: { value: string; onChange: (v: string) => void; placeholder?: string; invalid?: boolean }) {
+  return <input type="number" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+    aria-invalid={invalid || undefined} style={invalid ? { ...inputStyle, borderColor: "#ef4444" } : inputStyle} />;
 }
 
 function Select({ value, onChange, options, required }: { value: string; onChange: (v: string) => void; options: readonly string[]; required?: boolean }) {
@@ -308,8 +345,8 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
 
 // ── Provider detail ───────────────────────────────────────────────────────────
 
-function ProviderDetail({ name, editingName, provider, onChange, onEditingNameChange, onRename, onDelete, onAddModels, enabledModels }: {
-  name: string; editingName: string; provider: ProviderEntry;
+function ProviderDetail({ name, editingName, fallbackLabel, provider, onChange, onEditingNameChange, onRename, onDelete, onAddModels, enabledModels }: {
+  name: string; editingName: string; fallbackLabel: string; provider: ProviderEntry;
   onChange: (p: ProviderEntry) => void; onEditingNameChange: (n: string) => void;
   onRename: (n: string) => void; onDelete: () => void;
   onAddModels: (models: DiscoveredModel[]) => void; enabledModels: EnabledModelsController;
@@ -411,8 +448,8 @@ function ProviderDetail({ name, editingName, provider, onChange, onEditingNameCh
         <EnabledModelsProviderSwitchNote providerId={name} controller={enabledModels} id={switchNoteId} />
       </div>
 
-       <Field label={t("i18n.providerName")}>
-        <TextInput value={editingName} onChange={onEditingNameChange} placeholder="provider-name" mono />
+       <Field label={t("i18n.providerId")}>
+        <TextInput value={editingName} onChange={onEditingNameChange} placeholder="provider-id" mono />
         {editingName !== name && editingName.trim() && (
           <button onClick={() => onRename(editingName.trim())}
             style={{ marginTop: 4, padding: "3px 10px", background: "var(--accent)", border: "none", borderRadius: 4, color: "var(--accent-contrast)", cursor: "pointer", fontSize: 11, alignSelf: "flex-start" }}>
@@ -421,20 +458,20 @@ function ProviderDetail({ name, editingName, provider, onChange, onEditingNameCh
         )}
       </Field>
 
+      {/* models.json `name`: the label the sidebar and the selector show (#1567). */}
+      <Field label={t("models.providerDisplayName")}>
+        <TextInput value={provider.name ?? ""} onChange={(v) => onChange(setProviderDisplayName(provider, v))}
+          placeholder={fallbackLabel} />
+      </Field>
+
       <Field label="Base URL">
         <TextInput value={provider.baseUrl ?? ""} onChange={(v) => set("baseUrl", v || undefined)}
-          placeholder="https://api.example.com/v1" mono />
-        <span style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>
-          Leave empty for a built-in provider to use the endpoint pi ships
-        </span>
+          placeholder="https://api.example.com/v1" inputMode="url" mono />
       </Field>
 
       <Field label="API Key">
         <SecretTextInput value={provider.apiKey ?? ""} onChange={(v) => set("apiKey", v || undefined)}
-          placeholder="ENV_VAR_NAME, !shell-command, or literal key" mono />
-        <span style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>
-          Prefix with <code style={{ fontFamily: "var(--font-mono)" }}>!</code> to run a shell command, or use an env var name
-        </span>
+          placeholder={t("models.apiKeyPlaceholder")} mono />
       </Field>
 
       <Field label="API">
@@ -446,9 +483,6 @@ function ProviderDetail({ name, editingName, provider, onChange, onEditingNameCh
           headers={provider.headers}
           onChange={(headers) => set("headers", headers)}
         />
-        <span style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>
-          Added to every request from this provider (e.g. User-Agent). Useful for gateways with bot detection.
-        </span>
       </Field>
 
       <div style={{ borderTop: "1px solid var(--border)", paddingTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
@@ -578,6 +612,7 @@ function ThinkingLevelMapEditor({
   value: Record<string, string | null> | undefined;
   onChange: (v: Record<string, string | null> | undefined) => void;
 }) {
+  const { t } = useI18n();
   const map = value ?? {};
 
   const setLevel = (level: ThinkingLevel, entry: string | null | "omit") => {
@@ -651,13 +686,13 @@ function ThinkingLevelMapEditor({
                 onClick={() => setLevel(level, "omit")}
                 style={{ ...btnBase, ...(state === "omit" ? btnActive : {}) }}
               >
-                Default
+                {t("i18n.default")}
               </button>
               <button
                 onClick={() => setLevel(level, null)}
                 style={{ ...btnBase, borderLeft: "1px solid var(--border)", ...(state === "null" ? btnActiveDisabled : {}) }}
               >
-                Disabled
+                {t("i18n.disabled")}
               </button>
             </div>
 
@@ -666,7 +701,7 @@ function ThinkingLevelMapEditor({
                 onClick={() => setLevel(level, strVal || level)}
                 style={{ ...btnBase, ...(state === "string" ? btnActive : {}), borderRight: "1px solid var(--border)", flexShrink: 0 }}
               >
-                Custom
+                {t("i18n.custom")}
               </button>
               <input
                 value={strVal}
@@ -730,6 +765,7 @@ function HeaderListEditor({ headers, onChange }: {
   headers: Record<string, string> | undefined;
   onChange: (h: Record<string, string> | undefined) => void;
 }) {
+  const { t } = useI18n();
   const [rows, setRows] = useState<HeaderRow[]>(() => Object.entries(headers ?? {}).map(
     ([name, value], id) => ({ id, name, value }),
   ));
@@ -760,10 +796,10 @@ function HeaderListEditor({ headers, onChange }: {
       {rows.map((row) => (
         <div key={row.id} style={{ display: "flex", gap: 6 }}>
           <input value={row.name} onChange={(e) => setEntry(row.id, { name: e.target.value })}
-            placeholder="Header-Name" style={{ ...inputStyle, fontFamily: "var(--font-mono)", flex: 1 }} />
+            aria-label={t("models.headerName")} placeholder="Header-Name" style={{ ...inputStyle, fontFamily: "var(--font-mono)", flex: 1 }} />
           <input value={row.value} onChange={(e) => setEntry(row.id, { value: e.target.value })}
-            placeholder="value" style={{ ...inputStyle, fontFamily: "var(--font-mono)", flex: 1 }} />
-          <button onClick={() => removeEntry(row.id)} style={rowBtnStyle}>✕</button>
+            aria-label={t("models.headerValue")} placeholder="value" style={{ ...inputStyle, fontFamily: "var(--font-mono)", flex: 1 }} />
+          <button aria-label={t("models.removeHeader")} onClick={() => removeEntry(row.id)} style={rowBtnStyle}>✕</button>
         </div>
       ))}
       <button onClick={() => setRows((current) => [
@@ -771,7 +807,7 @@ function HeaderListEditor({ headers, onChange }: {
         { id: nextRowIdRef.current++, name: "", value: "" },
       ])}
         style={{ padding: "5px 9px", background: "none", border: "1px solid var(--border)", borderRadius: 4, color: "var(--text-muted)", cursor: "pointer", fontSize: 11, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5, alignSelf: "flex-start" }}>
-        + Add header
+        + {t("models.addHeader")}
       </button>
     </div>
   );
@@ -842,6 +878,8 @@ function ModelDetail({
   const [costDraft, setCostDraft] = useState<ModelCostDraft>(() => modelCostToDraft(model.cost));
   const costDraftRef = useRef(costDraft);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const testRequestIdRef = useRef(0);
+  const effectiveBaseUrl = model.baseUrl ?? provider.baseUrl;
   const catalogRequestIdRef = useRef(0);
   const catalogUndoRef = useRef<ModelEntry | null>(null);
   const costTemplateRef = useRef(model.cost);
@@ -885,17 +923,21 @@ function ModelDetail({
   })();
 
   useEffect(() => {
+    testRequestIdRef.current += 1;
     setTestState({ phase: "idle" });
-  }, [providerName, provider.baseUrl, provider.api, provider.apiKey, model.id, model.api]);
+    // An in-flight result belongs to the old draft, including after unmount.
+    return () => { testRequestIdRef.current += 1; };
+  }, [providerName, provider, model]);
 
   useEffect(() => {
     catalogRequestIdRef.current += 1;
     setCatalogState({ phase: "idle" });
     catalogUndoRef.current = null;
-  }, [providerName, provider.baseUrl, model.id]);
+  }, [providerName, effectiveBaseUrl, model.id]);
 
   const handleTest = useCallback(async () => {
     if (!model.id.trim() || testState.phase === "testing") return;
+    const requestId = ++testRequestIdRef.current;
     setTestState({ phase: "testing" });
     try {
       const res = await fetch("/api/models-config/test", {
@@ -910,6 +952,7 @@ function ModelDetail({
         status?: number;
         responseText?: string;
       };
+      if (requestId !== testRequestIdRef.current) return;
       if (!res.ok || !d.ok) {
         setTestState({
           phase: "error",
@@ -926,6 +969,7 @@ function ModelDetail({
         responseText: d.responseText,
       });
     } catch (e) {
+      if (requestId !== testRequestIdRef.current) return;
       setTestState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
     }
   }, [model, provider, providerName, testState.phase]);
@@ -937,7 +981,7 @@ function ModelDetail({
     setCatalogState({ phase: "loading" });
     try {
       const params = new URLSearchParams({ q: query, provider: providerName, limit: "50" });
-      if (provider.baseUrl?.trim()) params.set("baseUrl", provider.baseUrl.trim());
+      if (effectiveBaseUrl?.trim()) params.set("baseUrl", effectiveBaseUrl.trim());
       const res = await fetch(`/api/models-config/catalog?${params}`);
       const data = await res.json() as { recommendation?: ModelCatalogRecommendation; error?: string };
       if (requestId !== catalogRequestIdRef.current) return;
@@ -960,7 +1004,7 @@ function ModelDetail({
       if (requestId !== catalogRequestIdRef.current) return;
       setCatalogState({ phase: "error", message: error instanceof Error ? error.message : String(error) });
     }
-  }, [catalogState.phase, model, onChange, provider.baseUrl, providerName]);
+  }, [catalogState.phase, model, onChange, effectiveBaseUrl, providerName]);
 
   const undoCatalogFill = () => {
     const previous = catalogUndoRef.current;
@@ -1022,7 +1066,10 @@ function ModelDetail({
     remainingCompatKeys.delete("supportsDeveloperRole");
   }
   compatibilityOverrideCount += remainingCompatKeys.size;
+  const imageLimit = imageMaxBytes(model);
+  const parsedImageLimit = parseImageMaxBytes(imageLimit);
   const advancedSummaryParts = [
+    model.baseUrl ? t("models.baseUrlOverride") : null,
     model.api ? `API: ${model.api}` : null,
     Object.keys(model.headers ?? {}).length
       ? t("models.headersSummary", { count: Object.keys(model.headers ?? {}).length })
@@ -1032,6 +1079,9 @@ function ModelDetail({
       : null,
     Object.keys(model.thinkingLevelMap ?? {}).length
       ? t("models.thinkingSummary", { count: Object.keys(model.thinkingLevelMap ?? {}).length })
+      : null,
+    parsedImageLimit !== undefined
+      ? t("models.imageMaxBytesSummary", { size: formatImageBytes(parsedImageLimit) })
       : null,
   ].filter((part): part is string => Boolean(part));
   const advancedSummary = advancedSummaryParts.length
@@ -1089,7 +1139,7 @@ function ModelDetail({
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         <Field label="ID *"><TextInput value={model.id} onChange={(v) => set("id", v)} placeholder="model-id" mono /></Field>
-        <Field label="Name"><TextInput value={model.name ?? ""} onChange={(v) => set("name", v || undefined)} placeholder="Display name" /></Field>
+        <Field label="Name"><TextInput value={model.name ?? ""} onChange={(v) => set("name", v || undefined)} placeholder={t("models.displayNamePlaceholder")} /></Field>
       </div>
 
       <div style={{ padding: "2px 0" }}>
@@ -1247,6 +1297,11 @@ function ModelDetail({
 
         {advancedOpen && (
           <div id="model-advanced-settings" style={{ display: "flex", flexDirection: "column", gap: 14, padding: "4px 0 16px" }}>
+            <Field label={t("models.baseUrlOverride")}>
+              <TextInput value={model.baseUrl ?? ""} onChange={(v) => set("baseUrl", v.trim() || undefined)}
+                placeholder={provider.baseUrl ?? t("models.providerDefaults")} inputMode="url" mono />
+            </Field>
+
             <Field label={t("models.apiOverride")}>
               <Select value={model.api ?? ""} onChange={(v) => set("api", v || undefined)} options={API_OPTIONS} />
             </Field>
@@ -1261,6 +1316,24 @@ function ModelDetail({
               </span>
             </Field>
 
+            {(model.input?.includes("image") || imageLimit !== undefined) && (
+              <Field label={t("models.imageMaxBytes")}>
+                <NumInput
+                  value={imageLimit === undefined ? "" : String(imageLimit)}
+                  onChange={(v) => onChange(withImageMaxBytes(model, v.trim() || undefined))}
+                  placeholder={String(DEFAULT_IMAGE_MAX_BYTES)}
+                  invalid={parsedImageLimit === undefined && imageLimit !== undefined}
+                />
+                <span style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>
+                  {parsedImageLimit !== undefined && `${formatImageBytes(parsedImageLimit)} · `}
+                  {t("models.imageMaxBytesHelp", { size: formatImageBytes(DEFAULT_IMAGE_MAX_BYTES) })}
+                </span>
+                <code style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>
+                  inputLimits.images.resize.maxBytes
+                </code>
+              </Field>
+            )}
+
             {model.reasoning && (
               <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 <SectionTitle>{t("models.compatibility")}</SectionTitle>
@@ -1274,6 +1347,18 @@ function ModelDetail({
                   checked={effectiveCompat(provider, model)["supportsDeveloperRole"] !== false}
                   onChange={(v) => onChange(setCompatBool(model, "supportsDeveloperRole", v))}
                 />
+                {(model.api ?? provider.api) === "anthropic-messages" && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    <Check
+                      label={t("models.adaptiveThinking")}
+                      checked={effectiveCompat(provider, model)["forceAdaptiveThinking"] === true}
+                      onChange={(v) => onChange(setCompatFlag(model, "forceAdaptiveThinking", v, provider.compat?.["forceAdaptiveThinking"] === true))}
+                    />
+                    <code style={{ fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-mono)", paddingLeft: 19 }}>
+                      compat.forceAdaptiveThinking
+                    </code>
+                  </div>
+                )}
                 <div style={{ marginTop: 4 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8 }}>
                     <SectionTitle>{t("models.thinkingLevelMap")}</SectionTitle>
@@ -1378,9 +1463,9 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
     };
     es.onerror = () => {
       es.close();
-      setLoginState((prev) => prev.phase === "success" ? prev : { phase: "error", message: "Connection lost" });
+      setLoginState((prev) => prev.phase === "success" ? prev : { phase: "error", message: t("models.connectionLost") });
     };
-  }, [provider.id, onRefresh]);
+  }, [provider.id, onRefresh, t]);
 
   const handleLogout = useCallback(async () => {
     await fetch(`/api/auth/logout/${encodeURIComponent(provider.id)}`, { method: "POST" });
@@ -1390,7 +1475,7 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
 
   const submitCode = useCallback(async (token: string, code: string) => {
     if (!code.trim()) return;
-    setLoginState({ phase: "progress", message: "Verifying…" });
+    setLoginState({ phase: "progress", message: t("models.verifying") });
     try {
       const res = await fetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
         method: "POST",
@@ -1399,18 +1484,18 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({})) as { error?: string };
-        setLoginState({ phase: "error", message: d.error ?? `Server error ${res.status}` });
+        setLoginState({ phase: "error", message: d.error ?? t("models.serverError", { status: res.status }) });
         return;
       }
       setInputValue("");
       // Success path: SSE stream will emit "success" and update state
     } catch (e) {
-      setLoginState({ phase: "error", message: e instanceof Error ? e.message : "Network error" });
+      setLoginState({ phase: "error", message: e instanceof Error ? e.message : t("i18n.networkError") });
     }
-  }, [provider.id]);
+  }, [provider.id, t]);
 
   const submitSelection = useCallback(async (token: string, value: string) => {
-    setLoginState({ phase: "progress", message: "Continuing…" });
+    setLoginState({ phase: "progress", message: t("i18n.continuing") });
     try {
       const res = await fetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
         method: "POST",
@@ -1419,12 +1504,12 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({})) as { error?: string };
-        setLoginState({ phase: "error", message: d.error ?? `Server error ${res.status}` });
+        setLoginState({ phase: "error", message: d.error ?? t("models.serverError", { status: res.status }) });
       }
     } catch (e) {
-      setLoginState({ phase: "error", message: e instanceof Error ? e.message : "Network error" });
+      setLoginState({ phase: "error", message: e instanceof Error ? e.message : t("i18n.networkError") });
     }
-  }, [provider.id]);
+  }, [provider.id, t]);
 
   const isWorking = loginState.phase === "connecting" || loginState.phase === "progress" ||
     loginState.phase === "auth" || loginState.phase === "device_code" ||
@@ -1478,7 +1563,7 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
         {loginState.phase === "idle" && (
           !provider.loggedIn && (
             <p style={{ margin: 0, fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
-              Connect your {provider.name} account.
+              {t("models.oauthConnect", { provider: provider.name })}
             </p>
           )
         )}
@@ -1506,19 +1591,19 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
         {(loginState.phase === "auth" || loginState.phase === "prompt") && (
           <OAuthPastePanel
             message={loginState.phase === "auth"
-              ? "Complete sign-in in the browser, then copy the redirect URL from the address bar and paste it below."
+              ? t("models.oauthPasteRedirect")
               : loginState.message}
             hint={loginState.phase === "auth" ? (
               <>
-                If the browser window did not open,{" "}
+                {t("models.oauthNoBrowser")}{" "}
                 <a href={loginState.url} target="_blank" rel="noopener noreferrer">
-                  click here to open the login page
+                  {t("models.oauthOpenLoginPage")}
                 </a>
-                .
+                {t("models.oauthOpenLoginPageEnd")}
               </>
             ) : undefined}
             value={inputValue}
-            placeholder={loginState.phase === "auth" ? "http://localhost:1455/auth/callback?code=…" : (loginState.placeholder ?? "Enter value…")}
+            placeholder={loginState.phase === "auth" ? "http://localhost:1455/auth/callback?code=…" : (loginState.placeholder ?? t("models.oauthValuePlaceholder"))}
             submitLabel={t("i18n.submit")}
             inputRef={inputRef}
             onValueChange={setInputValue}
@@ -1528,7 +1613,7 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
         {loginState.phase === "device_code" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <p style={{ margin: 0, fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
-              Open the verification page and enter this code:
+              {t("models.oauthDeviceCode")}
             </p>
             <div style={{ padding: "8px 10px", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 5, color: "var(--text)", fontSize: 16, fontWeight: 700, fontFamily: "var(--font-mono)", letterSpacing: 0 }}>
               {loginState.userCode}
@@ -1537,7 +1622,7 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
               <a href={loginState.verificationUri} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)", wordBreak: "break-all" }}>
                 {loginState.verificationUri}
               </a>
-              {loginState.expiresInSeconds ? ` Expires in ${Math.ceil(loginState.expiresInSeconds / 60)} minutes.` : ""}
+              {loginState.expiresInSeconds ? ` ${t("models.deviceCodeExpires", { minutes: Math.ceil(loginState.expiresInSeconds / 60) })}` : ""}
             </p>
           </div>
         )}
@@ -1561,26 +1646,25 @@ function OAuthDetail({ provider, onRefresh, enabledModels, contextSettings }: {
 
 // ── API Key detail ────────────────────────────────────────────────────────────
 
+// pi's default router address (`/login llama.cpp`, docs/llama-cpp.md).
+const DEFAULT_LLAMA_ROUTER_URL = "http://127.0.0.1:8080";
+
 function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
   provider: ApiKeyProvider; onRefresh: () => void; enabledModels: EnabledModelsController;
   contextSettings: ModelContextSettings;
 }) {
+  const llama = provider.id === LLAMA_CPP_PROVIDER_ID;
+  const [serverUrl, setServerUrl] = useState(llama && !provider.configured ? DEFAULT_LLAMA_ROUTER_URL : "");
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [removing, setRemoving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedOk, setSavedOk] = useState(false);
   const { t } = useI18n();
+  const canSave = Boolean(llama ? serverUrl.trim() : apiKey.trim());
 
-  // Reset state when provider changes
-  useEffect(() => {
-    setApiKey("");
-    setError(null);
-    setSavedOk(false);
-  }, [provider.id]);
-
-  const handleSave = useCallback(async () => {
-    if (!apiKey.trim()) return;
+  async function handleSave() {
+    if (!canSave || saving) return;
     setSaving(true);
     setError(null);
     setSavedOk(false);
@@ -1588,13 +1672,18 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
       const res = await fetch(`/api/auth/api-key/${encodeURIComponent(provider.id)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey: apiKey.trim() }),
+        body: JSON.stringify({ apiKey: apiKey.trim(), ...(llama ? { serverUrl: serverUrl.trim() } : {}) }),
       });
-      const d = await res.json() as { success?: boolean; error?: string };
+      const d = await res.json() as { error?: string; catalog?: { completed: boolean; reason?: string } };
       if (!res.ok || d.error) {
         setError(d.error ?? `HTTP ${res.status}`);
       } else {
         setApiKey("");
+        if (llama) {
+          setServerUrl("");
+          enabledModels.refresh();
+          if (!d.catalog?.completed) setError(t(d.catalog?.reason === "offline" ? "models.catalogOffline" : "models.catalogUnreachable"));
+        }
         setSavedOk(true);
         setTimeout(() => setSavedOk(false), 2000);
         onRefresh();
@@ -1604,7 +1693,7 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
     } finally {
       setSaving(false);
     }
-  }, [apiKey, provider.id, onRefresh]);
+  }
 
   const handleRemove = useCallback(async () => {
     setRemoving(true);
@@ -1625,7 +1714,7 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <ConfigDetailHeader>
         <ConfigDetailHeaderInfo>
-          <SectionTitle>API Key</SectionTitle>
+          <SectionTitle>{llama ? provider.displayName : "API Key"}</SectionTitle>
         </ConfigDetailHeaderInfo>
         <ConfigDetailActions>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -1647,9 +1736,18 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
         </ConfigDetailActions>
       </ConfigDetailHeader>
 
-      {!provider.configured && (
+      {llama && (
+        <label style={{ display: "grid", gap: 6 }}>
+          {t("models.llamaRouterUrl")}
+          <input type="url" style={inputStyle} value={serverUrl} placeholder={DEFAULT_LLAMA_ROUTER_URL}
+            onChange={(event) => setServerUrl(event.target.value)} spellCheck={false} />
+        </label>
+      )}
+      {!llama && !provider.configured && (
         <p style={{ margin: 0, fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
-          Enter your {provider.displayName} API key to enable {provider.modelCount} model{provider.modelCount !== 1 ? "s" : ""}.
+          {provider.modelCount === 1
+            ? t("models.apiKeyEnableOne", { provider: provider.displayName })
+            : t("models.apiKeyEnable", { provider: provider.displayName, count: provider.modelCount })}
         </p>
       )}
 
@@ -1657,8 +1755,12 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
         <SecretTextInput
           value={apiKey}
           onChange={setApiKey}
-          onKeyDown={(e) => { if (e.key === "Enter" && apiKey.trim()) handleSave(); }}
-          placeholder={provider.configured ? "Enter new key to replace…" : "sk-…"}
+          onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+            if (e.key === "Enter") handleSave();
+          }}
+          enterKeyHint="done"
+          placeholder={llama ? t("models.optionalApiKey") : provider.configured ? t("models.replaceApiKey") : "sk-…"}
           style={{ flex: 1 }}
           autoComplete="off"
           spellCheck={false}
@@ -1666,13 +1768,13 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
         />
         <button
           onClick={handleSave}
-          disabled={saving || !apiKey.trim() || savedOk}
+          disabled={saving || !canSave || savedOk}
           style={{
             padding: "6px 12px",
-            background: savedOk ? "#16a34a" : apiKey.trim() ? "var(--accent)" : "var(--bg-panel)",
+            background: savedOk ? "#16a34a" : canSave ? "var(--accent)" : "var(--bg-panel)",
             border: "none", borderRadius: 5,
-            color: savedOk ? "#fff" : apiKey.trim() ? "var(--accent-contrast)" : "var(--text-dim)",
-            cursor: (saving || !apiKey.trim() || savedOk) ? "not-allowed" : "pointer",
+            color: savedOk ? "#fff" : canSave ? "var(--accent-contrast)" : "var(--text-dim)",
+            cursor: (saving || !canSave || savedOk) ? "not-allowed" : "pointer",
             fontSize: 12, fontWeight: 600, flexShrink: 0,
             display: "flex", alignItems: "center", gap: 5,
           }}
@@ -1690,7 +1792,14 @@ function ApiKeyDetail({ provider, onRefresh, enabledModels, contextSettings }: {
 
       <ProviderUsageSummary providerId={provider.id} enabled={provider.configured} />
 
-      {provider.configured && <EnabledModelsSection providerId={provider.id} controller={enabledModels} contextSettings={contextSettings} />}
+      {provider.configured && (
+        <EnabledModelsSection
+          providerId={provider.id}
+          controller={enabledModels}
+          contextSettings={contextSettings}
+          emptyCatalogHint={llama ? t("models.llamaEmptyCatalog") : undefined}
+        />
+      )}
     </div>
   );
 }
@@ -1718,8 +1827,8 @@ function AddProviderPicker({
 
   const q = search.trim().toLowerCase();
 
-  const availableOAuth = oauthProviders.filter((p) => !p.loggedIn && (!q || p.name.toLowerCase().includes(q)));
-  const availableApiKey = apiKeyProviders.filter((p) => !p.configured && (!q || p.displayName.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)));
+  const availableOAuth = oauthProviders.filter((p) => !p.loggedIn && providerMatchesSearch(q, p.id, p.name));
+  const availableApiKey = apiKeyProviders.filter((p) => !p.configured && providerMatchesSearch(q, p.id, p.displayName));
   const showCustom = !q || "custom".includes(q) || "openai-compatible".includes(q) || "anthropic-compatible".includes(q);
 
   const totalCount = availableOAuth.length + availableApiKey.length + (showCustom ? 1 : 0);
@@ -1745,7 +1854,7 @@ function AddProviderPicker({
       style={{ position: "fixed", inset: 0, zIndex: 1100, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center" }}
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
       onKeyDown={(e) => {
-        if (e.key !== "Escape") return;
+        if (e.key !== "Escape" || e.nativeEvent.isComposing || e.keyCode === 229) return;
         e.preventDefault();
         e.stopPropagation();
         onClose();
@@ -1822,7 +1931,11 @@ function AddProviderPicker({
                 >
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", lineHeight: 1.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.displayName}</div>
-                    <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>{p.modelCount} models</div>
+                    <div style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 2 }}>
+                      {p.id === LLAMA_CPP_PROVIDER_ID
+                        ? t("models.optionalApiKey")
+                        : t(p.modelCount === 1 ? "models.modelCountOne" : "models.modelCount", { count: p.modelCount })}
+                    </div>
                   </div>
                   <ProviderIcon id={p.id} size={28} />
                 </button>
@@ -1842,6 +1955,7 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
   onClose: () => void; embedded?: boolean; cwd?: string | null;
 }) {
   const { t } = useI18n();
+  const { openDetail, closeDetail } = useConfigDetailNavigation();
   // `enabledModels` lives in pi's settings, not models.json, so these switches
   // apply immediately instead of waiting for this panel's Save button.
   const enabledModels = useEnabledModels(cwd);
@@ -1856,6 +1970,10 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
   const [selection, setSelection] = useState<Selection | null>(readRememberedSelection);
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([]);
   const [apiKeyProviders, setApiKeyProviders] = useState<ApiKeyProvider[]>([]);
+  /** Runtime display names of every provider, including ones with no chat models. */
+  const [providerNames, setProviderNames] = useState<Record<string, string>>({});
+  /** Each provider's models.json `name` as saved, which pi also reports as its runtime name. */
+  const [savedNames, setSavedNames] = useState<Map<string, string>>(() => new Map());
   /** Set once the provider lists have answered; until then an overrides-only entry may be a managed provider's. */
   const [authListed, setAuthListed] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -1868,22 +1986,29 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
    * from an unrelated edit without guessing.
    */
   const savedModelIdsRef = useRef<Map<string, (string | null)[]>>(new Map());
+  /** Sidebar row keys by model object: a moved row stays mounted, and keeps focus. */
+  const modelKeysRef = useRef(new WeakMap<ModelEntry, string>());
+  const modelKeySequenceRef = useRef(0);
+  /** The model row being dragged, and the row its drop line is on. */
+  const draggedModelRef = useRef<{ providerName: string; index: number } | null>(null);
+  const [modelDrop, setModelDrop] = useState<{ providerName: string; index: number; after: boolean } | null>(null);
   /**
    * The provider name field while it differs from the provider's id. Save
    * applies it like every other visible edit; Rename applies it right away.
    */
   const [providerNameDraft, setProviderNameDraft] = useState<{ provider: string; name: string } | null>(null);
 
-  const refreshAuthProviders = useCallback(() => {
-    fetch("/api/auth/providers")
-      .then((r) => r.json())
-      .then((d: { oauthProviders?: OAuthProvider[]; apiKeyProviders?: ApiKeyProvider[] }) => {
-        if (Array.isArray(d.oauthProviders)) setOauthProviders(d.oauthProviders);
-        if (Array.isArray(d.apiKeyProviders)) setApiKeyProviders(d.apiKeyProviders);
-      })
-      .catch(() => {})
-      .finally(() => setAuthListed(true));
-  }, []);
+  /** Resolves true once the lists and runtime names have been replaced. */
+  const refreshAuthProviders = useCallback(() => fetch("/api/auth/providers")
+    .then((r) => r.json())
+    .then((d: { oauthProviders?: OAuthProvider[]; apiKeyProviders?: ApiKeyProvider[]; providerNames?: Record<string, string> }) => {
+      if (Array.isArray(d.oauthProviders)) setOauthProviders(d.oauthProviders);
+      if (Array.isArray(d.apiKeyProviders)) setApiKeyProviders(d.apiKeyProviders);
+      setProviderNames(d.providerNames ?? {});
+      return true;
+    })
+    .catch(() => false)
+    .finally(() => setAuthListed(true)), []);
 
   useEffect(() => {
     fetch("/api/models-config")
@@ -1897,6 +2022,7 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
         setConfig(normalized);
         savedProvidersRef.current = new Set(Object.keys(normalized.providers ?? {}));
         savedModelIdsRef.current = savedModelIds(normalized);
+        setSavedNames(savedProviderNames(normalized));
         const keys = Object.keys(normalized.providers ?? {});
         setSelection((current) => current && customSelectionExists(normalized, current)
           ? current
@@ -1917,13 +2043,14 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
   useEffect(() => {
     if (selection?.type !== "provider") return;
     const entry = config.providers?.[selection.name];
-    if (!entry || Object.keys(entry).length !== 1 || !entry.modelOverrides) return;
+    // Clearing a saved display name leaves only overrides: keep the panel until the name is saved away.
+    if (!entry || !isOverridesOnly(entry) || savedNames.has(selection.name)) return;
     if (oauthProviders.some((provider) => provider.id === selection.name)) {
       setSelection({ type: "oauth", providerId: selection.name });
     } else if (apiKeyProviders.some((provider) => provider.id === selection.name)) {
       setSelection({ type: "apikey", providerId: selection.name });
     }
-  }, [apiKeyProviders, config.providers, oauthProviders, selection]);
+  }, [apiKeyProviders, config.providers, oauthProviders, savedNames, selection]);
 
   const contextSettings = (providerId: string): ModelContextSettings => ({
     overrides: config.providers?.[providerId]?.modelOverrides,
@@ -1974,23 +2101,22 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
 
   const renameProvider = useCallback((oldName: string, newName: string) => {
     if (applyProviderRename(config, oldName, newName)) setSaveError(null);
-    else setSaveError(t("models.providerNameTaken", { name: newName }));
+    else setSaveError(t("models.providerIdTaken", { name: newName }));
   }, [applyProviderRename, config, t]);
 
   const deleteProvider = useCallback((name: string) => {
-    savedModelIdsRef.current.delete(name);
+    const next = deleteProviderEntry(config, {
+      savedProviders: savedProvidersRef.current,
+      renames: renamesRef.current,
+      slots: savedModelIdsRef.current,
+    }, name);
+    const remaining = Object.keys(next.providers ?? {});
     setProviderNameDraft((prev) => prev?.provider === name ? null : prev);
-    setConfig((prev) => {
-      const providers = { ...(prev.providers ?? {}) };
-      delete providers[name];
-      return { ...prev, providers };
-    });
-    setConfig((prev) => {
-      const remaining = Object.keys(prev.providers ?? {});
-      setSelection(remaining.length > 0 ? { type: "provider", name: remaining[0] } : null);
-      return prev;
-    });
-  }, []);
+    setConfig(next);
+    setSelection(remaining.length > 0 ? { type: "provider", name: remaining[0] } : null);
+    // A phone goes back to the list the provider left, not to another provider's detail.
+    closeDetail();
+  }, [config, closeDetail]);
 
   const addModel = useCallback((providerName: string) => {
     trackAddedModels(savedModelIdsRef.current, providerName, 1);
@@ -2031,10 +2157,81 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
     setConfig((prev) => {
       const provider = prev.providers?.[providerName] ?? {};
       const models = [...(provider.models ?? [])];
+      // The edited model keeps its row key, so its sidebar row is not remounted on every keystroke.
+      const key = modelKeysRef.current.get(models[index]);
+      if (key) modelKeysRef.current.set(m, key);
       models[index] = m;
       return { ...prev, providers: { ...(prev.providers ?? {}), [providerName]: { ...provider, models } } };
     });
   }, []);
+
+  const applyModelOrder = useCallback((change: ModelOrderChange<ModelsJson> | null) => {
+    if (!change) return;
+    setConfig(change.config);
+    setSavedOk(false);
+    setSaveError(null);
+    setSelection((current) => current?.type === "model" && current.providerName === change.providerName
+      ? { ...current, index: change.order.indexOf(current.index) }
+      : current);
+  }, []);
+
+  const moveModel = useCallback((providerName: string, from: number, to: number) => {
+    if (saving || loadError) return;
+    applyModelOrder(moveModelEntry(config, savedModelIdsRef.current, providerName, from, to));
+  }, [applyModelOrder, config, loadError, saving]);
+
+  /**
+   * Native drag and drop of a model row within its provider, as the right
+   * panel's tabs do: desktop only (iOS never starts it from a touch), with the
+   * browser's own edge scrolling.
+   */
+  const modelDragProps = (providerName: string, index: number, modelId: string): ButtonHTMLAttributes<HTMLButtonElement> => {
+    const target = (event: DragEvent<HTMLButtonElement>) => {
+      const dragged = draggedModelRef.current;
+      if (dragged?.providerName !== providerName) return null;
+      const rect = event.currentTarget.getBoundingClientRect();
+      const after = event.clientY >= rect.top + rect.height / 2;
+      return { from: dragged.index, to: modelDropIndex(dragged.index, index, after), after };
+    };
+    const endDrag = () => {
+      draggedModelRef.current = null;
+      setModelDrop(null);
+    };
+    return {
+      draggable: !saving && !loadError,
+      onDragStart: (event) => {
+        draggedModelRef.current = { providerName, index };
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", modelId);
+      },
+      onDragOver: (event) => {
+        const drop = target(event);
+        if (!drop) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        // No line where the drop would leave the order as it is.
+        const next = drop.to === drop.from ? null : { providerName, index, after: drop.after };
+        setModelDrop((prev) => prev?.providerName === next?.providerName && prev?.index === next?.index && prev?.after === next?.after ? prev : next);
+      },
+      onDragLeave: (event) => {
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        setModelDrop((prev) => prev?.providerName === providerName && prev.index === index ? null : prev);
+      },
+      onDrop: (event) => {
+        const drop = target(event);
+        if (!drop) return;
+        event.preventDefault();
+        moveModel(providerName, drop.from, drop.to);
+        endDrag();
+      },
+      onDragEnd: endDrag,
+    };
+  };
+
+  const sortModels = useCallback((providerName: string) => {
+    if (saving || loadError) return;
+    applyModelOrder(sortModelEntries(config, savedModelIdsRef.current, providerName));
+  }, [applyModelOrder, config, loadError, saving]);
 
   const removeModel = useCallback((providerName: string, index: number) => {
     savedModelIdsRef.current.get(providerName)?.splice(index, 1);
@@ -2045,7 +2242,8 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
       return { ...prev, providers: { ...(prev.providers ?? {}), [providerName]: { ...provider, models: models.length ? models : undefined } } };
     });
     setSelection({ type: "provider", name: providerName });
-  }, []);
+    closeDetail();
+  }, [closeDetail]);
 
   const handleSave = useCallback(async () => {
     if (loadError) return;
@@ -2059,7 +2257,7 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
     if (providerNameDraft && pendingName && config.providers?.[providerNameDraft.provider]) {
       const renamed = applyProviderRename(config, providerNameDraft.provider, pendingName);
       if (!renamed) {
-        setSaveError(t("models.providerNameTaken", { name: pendingName }));
+        setSaveError(t("models.providerIdTaken", { name: pendingName }));
         setSaving(false);
         return;
       }
@@ -2067,6 +2265,8 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
     }
     try {
       draft = normalizeContextWindowOverrides(draft);
+      checkProviderEntries(draft);
+      checkImageMaxBytes(draft);
       const res = await fetch("/api/models-config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -2086,19 +2286,36 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
         savedModelIdsRef.current = savedModelIds(draft);
         renamesRef.current.clear();
         enabledModels.resync(renames, modelRenames);
+        // Runtime names follow the saved ids and `name`s. Until they arrive, the old runtime
+        // name still equals the old saved `name`, so both move together.
+        const nextSavedNames = savedProviderNames(draft);
+        void refreshAuthProviders().then((refreshed) => { if (refreshed) setSavedNames(nextSavedNames); });
       }
     } catch (e) {
-      setSaveError(e instanceof ContextWindowError ? t("models.contextInvalid", { model: e.model }) : String(e));
+      if (e instanceof ProviderEntryError) {
+        setSaveError(t(PROVIDER_ENTRY_MESSAGES[e.problem], { provider: e.provider }));
+        // pi would not load the entry: show it, to be filled in or deleted.
+        setSelection({ type: "provider", name: e.provider });
+      } else if (e instanceof ContextWindowError) setSaveError(t("models.contextInvalid", { model: e.model }));
+      else setSaveError(e instanceof ImageMaxBytesError ? t("models.imageMaxBytesInvalid", { model: e.model }) : String(e));
     } finally {
       setSaving(false);
     }
-  }, [applyProviderRename, config, enabledModels, loadError, providerNameDraft, t]);
+  }, [applyProviderRename, config, enabledModels, loadError, providerNameDraft, refreshAuthProviders, t]);
 
   const providers = Object.entries(config.providers ?? {}).filter(([id, entry]) => {
-    if (Object.keys(entry).length !== 1 || !entry.modelOverrides) return true;
+    if (!isOverridesOnly(entry) || savedNames.has(id)) return true;
     const managed = oauthProviders.some((provider) => provider.id === id) || apiKeyProviders.some((provider) => provider.id === id);
     return authListed && !managed;
   });
+  const customProviderLabel = (providerId: string, entry: ProviderEntry) => providerSidebarLabel(
+    providerId,
+    entry,
+    providerRuntimeName(
+      providerNames[providerId] ?? enabledModels.view?.providers.find((provider) => provider.id === providerId)?.name,
+      savedNames.get(providerId),
+    ),
+  );
   // `12/40` next to a provider makes a narrowed selector visible at a glance.
   const scopeBadge = (providerId: string) => {
     const label = providerBadgeLabel(enabledModels.view, providerId);
@@ -2129,6 +2346,7 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
           key={selection.name}
           name={selection.name}
           editingName={providerNameDraft?.provider === selection.name ? providerNameDraft.name : selection.name}
+          fallbackLabel={customProviderLabel(selection.name, {})}
           provider={provider}
           onChange={(p) => updateProvider(selection.name, p)}
           onEditingNameChange={(n) => setProviderNameDraft(n === selection.name ? null : { provider: selection.name, name: n })}
@@ -2224,7 +2442,7 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
                         <line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" />
                       </svg>
                       <ConfigSidebarText className="is-grow">
-                        {pName}
+                        {customProviderLabel(pName, pData)}
                       </ConfigSidebarText>
                       {scopeBadge(pName)}
                     </ConfigSidebarItem>
@@ -2232,15 +2450,31 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
                     {/* Model rows */}
                     {models.map((m, i) => {
                       const isModelSelected = selection?.type === "model" && selection.providerName === pName && selection.index === i;
+                      let modelKey = modelKeysRef.current.get(m);
+                      if (!modelKey) {
+                        modelKey = `model-${++modelKeySequenceRef.current}`;
+                        modelKeysRef.current.set(m, modelKey);
+                      }
+                      const drop = modelDrop?.providerName === pName && modelDrop.index === i ? modelDrop : null;
                       return (
                         <ConfigSidebarItem
-                          key={i}
+                          key={modelKey}
                           active={isModelSelected}
                           className="models-sidebar-indented-item"
+                          style={drop ? { boxShadow: `inset 0 ${drop.after ? "-2px" : "2px"} 0 var(--accent)` } : undefined}
+                          aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
                           onClick={() => setSelection({ type: "model", providerName: pName, index: i })}
+                          onKeyDown={(event) => {
+                            if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+                            const direction = event.key === "ArrowUp" ? -1 : event.key === "ArrowDown" ? 1 : null;
+                            if (direction === null) return;
+                            event.preventDefault();
+                            moveModel(pName, i, i + direction);
+                          }}
+                          {...modelDragProps(pName, i, m.id)}
                         >
                           <ConfigSidebarText className="is-grow" style={{ color: m.id ? "var(--text-muted)" : "var(--text-dim)" }}>
-                             {m.id || t("i18n.newModel")}
+                            {modelSidebarLabel(m) || t("i18n.newModel")}
                           </ConfigSidebarText>
                           {m.reasoning && (
                             <span style={{ fontSize: 9, padding: "1px 4px", background: "rgba(99,102,241,0.12)", color: "rgba(99,102,241,0.8)", borderRadius: 3, flexShrink: 0 }}>T</span>
@@ -2249,20 +2483,33 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
                       );
                     })}
 
-                    {/* Add model button */}
-                    <ConfigSidebarItem
-                      className="models-sidebar-indented-item models-sidebar-add-item"
-                      onClick={(e) => { e.stopPropagation(); addModel(pName); }}
-                    >
-                       <ConfigSidebarText>+ {t("i18n.model")}</ConfigSidebarText>
-                    </ConfigSidebarItem>
+                    {/* Add model button, and A–Z */}
+                    <div className="models-sidebar-model-footer">
+                      <ConfigSidebarItem
+                        className="models-sidebar-indented-item models-sidebar-add-item"
+                        onClick={(e) => { e.stopPropagation(); addModel(pName); }}
+                      >
+                        <ConfigSidebarText>+ {t("i18n.model")}</ConfigSidebarText>
+                      </ConfigSidebarItem>
+                      <button
+                        type="button"
+                        className="models-sidebar-sort-button"
+                        aria-label={t("models.sortByName")}
+                        title={t("models.sortByName")}
+                        disabled={saving || loadError !== null || models.length < 2}
+                        onClick={() => sortModels(pName)}
+                      >
+                        A–Z
+                      </button>
+                    </div>
                   </div>
                 );
               })}
             </ConfigSidebarList>
 
             {/* Add provider */}
-            <ConfigListAction onClick={() => setPickerOpen(true)}>{t("i18n.addProvider")}</ConfigListAction>
+            {/* The picker chooses first; its choice opens the detail on a phone. */}
+            <ConfigListAction onClick={(event) => { event.preventDefault(); setPickerOpen(true); }}>{t("i18n.addProvider")}</ConfigListAction>
           </ConfigSidebar>
 
           {/* Right: detail */}
@@ -2276,11 +2523,11 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
         </ConfigSplitView>
 
         {/* Footer */}
-        <ConfigFooter status={(loadError || saveError) && (
+        <ConfigFooter status={(loadError || saveError) ? (
           <span style={{ color: "#f87171" }}>
             {loadError ? t("models.configUnreadable", { error: loadError }) : saveError}
           </span>
-        )}>
+        ) : t("models.applyHelp")}>
           {!embedded && <ConfigButton onClick={onClose}>{t("i18n.cancel")}</ConfigButton>}
           <ConfigButton
             variant="primary"
@@ -2302,9 +2549,9 @@ export function ModelsConfig({ onClose, embedded = false, cwd = null }: {
       <AddProviderPicker
         oauthProviders={oauthProviders}
         apiKeyProviders={apiKeyProviders}
-        onSelectOAuth={(id) => setSelection({ type: "oauth", providerId: id })}
-        onSelectApiKey={(id) => setSelection({ type: "apikey", providerId: id })}
-        onAddCustom={addCustomProvider}
+        onSelectOAuth={(id) => { setSelection({ type: "oauth", providerId: id }); openDetail(); }}
+        onSelectApiKey={(id) => { setSelection({ type: "apikey", providerId: id }); openDetail(); }}
+        onAddCustom={() => { addCustomProvider(); openDetail(); }}
         onClose={() => setPickerOpen(false)}
       />
     )}

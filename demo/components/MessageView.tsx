@@ -1,17 +1,21 @@
 "use client";
 
-import { memo, useState, useRef, useEffect, useMemo } from "react";
+import { memo, useState, useRef, useEffect, useMemo, type CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import { MarkdownBody } from "./MarkdownBody";
 import { ImagePreview } from "./ImagePreview";
 import { ThinkingIcon } from "./ThinkingIcon";
 import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/hooks/useI18n";
+import { useIsMobile } from "@/hooks/useIsMobile";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import { getAssistantErrorMessage, getThinkingPreview, hasAssistantAnswer, isAssistantTruncated, isEmptyThinkingBlock, splitThinkingPieces } from "@/lib/message-display";
-import { parseUnifiedPatch, type SplitDiffCell, type SplitDiffFile } from "@/lib/patch";
+import { stripAnsi } from "@/lib/ansi";
+import { diffGapLabel, parseUnifiedPatch, unifiedDiffLines, type SplitDiffCell, type SplitDiffFile, type SplitDiffGap, type UnifiedDiffLine } from "@/lib/patch";
 import { applyPatchPreviewToFiles, applyPatchResultHasFailures, extractApplyPatchPaths, getApplyPatchInputText, parseApplyPatchInput } from "@/lib/apply-patch";
-import { isApplyPatchToolName, isEditToolName } from "@/lib/tool-names";
+import { isApplyPatchToolName, isEditToolName, isWriteToolName } from "@/lib/tool-names";
+import { toolFieldsOfInput, type ToolField } from "@/lib/tool-fields";
+import { parse as parsePartialJson } from "partial-json";
 import { isToolCallExpanded, setToolCallExpanded } from "@/lib/tool-call-expansion";
 import { isThinkingExpandedByDefault, THINKING_EXPANDED_EVENT } from "@/lib/thinking-expansion-preference";
 import { TurnWrittenFiles } from "./TurnWrittenFiles";
@@ -393,7 +397,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
     copyText(copyTarget).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    }, () => {});
   };
 
   return (
@@ -705,10 +709,10 @@ function AssistantMessageView({
     .join("\n");
 
   const copyContent = () => {
-    copyText(textContent).then(() => {
+    copyText(stripAnsi(textContent)).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    }, () => {});
   };
 
   useEffect(() => {
@@ -955,14 +959,18 @@ function BlockView({ block, searchTarget, toolResults, isStreaming, streamingDur
 }
 
 function TextBlock({ block, isStreaming, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string, page?: number) => void }) {
-  return <SafeMarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{block.text}</SafeMarkdownBody>;
+  // pi's TUI hands the text to the terminal, which draws a model's escape sequences as styling;
+  // a browser would show them as raw "[38;5;5m" (#1753).
+  return <SafeMarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{stripAnsi(block.text)}</SafeMarkdownBody>;
 }
 
 // A model looping in its thinking can write megabytes. As one text node, every
 // streamed chunk laid all of it out again (the prompt anchor reads layout after
 // each commit). As pieces, only the last one changes. Thinking that fits one
 // piece stays one text node.
-function ThinkingText({ text }: { text: string }) {
+function ThinkingText({ text: rawText }: { text: string }) {
+  // Escape sequences dropped, as in TextBlock (#1753).
+  const text = useMemo(() => stripAnsi(rawText), [rawText]);
   const pieces = useMemo(() => splitThinkingPieces(text), [text]);
   if (pieces.length === 1) return text;
   // No memo: React already skips a div whose text is unchanged, and a memo
@@ -1100,11 +1108,20 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
     setToolCallExpanded(block.toolCallId, next);
     setExpanded(next);
   };
-  const inputStr = getToolCallInputText(block);
+  const writtenFileText = getWrittenFileText(block);
+  const inputStr = writtenFileText ?? getToolCallInputText(block);
   const isStreamingInput = block.rawInput !== undefined;
   const isEditTool = isEditToolName(block.toolName);
   const resultDiff = result && !result.isError ? getResultDiff(result) : null;
   const patchFiles = getApplyPatchFiles(block, result);
+  // Flat arguments as rows instead of a JSON blob, unless the card has a view of
+  // its own (a write's file text, an applied patch). See `lib/tool-fields.ts`.
+  // Input still streaming is parsed as far as it goes (the app uses pi's
+  // parseStreamingJson, which wraps the same partial-json parser).
+  const toolFields =
+    expanded && writtenFileText === null && patchFiles === null
+      ? toolFieldsOfInput(isStreamingInput ? parseStreamedInput(block.rawInput) : block.input)
+      : null;
   const patchLabel = isApplyPatchToolName(block.toolName)
     ? summarizeApplyPatchInput(block)
     : null;
@@ -1176,22 +1193,34 @@ function ToolCallBlock({ block, result, duration, onOpenSession }: { block: Tool
 
       {/* ── Expanded: input args (only when no richer view exists) ── */}
       {expanded && (isStreamingInput || !isEditTool) && !patchFiles && (
-        <pre
-          style={{
-            margin: 0,
-            padding: "8px 10px",
-            color: "var(--text-muted)",
-            fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
-            lineHeight: 1.5,
-            overflow: "auto",
-            background: "var(--bg-subtle)",
-            borderTop: isError ? "1px solid rgba(248,113,113,0.25)" : "1px solid rgba(34,197,94,0.2)",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-all",
-          }}
-        >
-          {inputStr}
-        </pre>
+        toolFields ? (
+          <div
+            style={{
+              padding: "6px 10px 8px",
+              background: "var(--bg-subtle)",
+              borderTop: isError ? "1px solid rgba(248,113,113,0.25)" : "1px solid rgba(34,197,94,0.2)",
+            }}
+          >
+            <ToolFieldRows fields={toolFields} />
+          </div>
+        ) : (
+          <pre
+            style={{
+              margin: 0,
+              padding: "8px 10px",
+              color: "var(--text-muted)",
+              fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
+              lineHeight: 1.5,
+              overflow: "auto",
+              background: "var(--bg-subtle)",
+              borderTop: isError ? "1px solid rgba(248,113,113,0.25)" : "1px solid rgba(34,197,94,0.2)",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-all",
+            }}
+          >
+            {inputStr}
+          </pre>
+        )
       )}
 
       {/* ── Result images — always visible, independent of the collapsed details ── */}
@@ -1254,7 +1283,21 @@ function SplitPatchView({ text }: { text: string }) {
   return <SplitFilesView files={files} />;
 }
 
+/** Two code columns side by side, or one column of patch lines. */
+export type PatchDiffLayout = "split" | "stacked";
+
+/**
+ * The patch as the viewport can show it. Two columns need two code columns side
+ * by side, which a phone does not have: there the same rows read as one column
+ * — a removed line above the line that replaces it, each with its own number —
+ * the way the file viewer's diff has always been drawn. See `unifiedDiffLines()`.
+ */
 function SplitFilesView({ files }: { files: SplitDiffFile[] }) {
+  const layout: PatchDiffLayout = useIsMobile() ? "stacked" : "split";
+  return <PatchDiffFiles files={files} layout={layout} />;
+}
+
+export function PatchDiffFiles({ files, layout }: { files: SplitDiffFile[]; layout: PatchDiffLayout }) {
   const { t } = useI18n();
   const showFileHeaders = files.length > 1;
 
@@ -1271,7 +1314,7 @@ function SplitFilesView({ files }: { files: SplitDiffFile[] }) {
             lineHeight: 1.55,
           }}
         >
-          {showFileHeaders && (
+          {showFileHeaders && layout === "split" && (
             <div
               style={{
                 display: "grid",
@@ -1288,10 +1331,34 @@ function SplitFilesView({ files }: { files: SplitDiffFile[] }) {
             </div>
           )}
 
+          {showFileHeaders && layout === "stacked" && stackedFilePath(file) && (
+            <div
+              title={stackedFilePath(file)}
+              style={{
+                position: "sticky",
+                top: 0,
+                zIndex: 1,
+                padding: "5px 10px",
+                color: "var(--text-dim)",
+                background: "var(--bg-panel)",
+                borderBottom: "1px solid var(--border)",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {stackedFilePath(file)}
+            </div>
+          )}
+
+          {layout === "split" && (
           <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)" }}>
             {file.rows.map((row, rowIndex) => {
               if (row.type === "hunk") {
                 return null;
+              }
+              if (row.type === "gap") {
+                return <DiffGapRow key={rowIndex} gap={row} />;
               }
 
               return (
@@ -1302,9 +1369,56 @@ function SplitFilesView({ files }: { files: SplitDiffFile[] }) {
               );
             })}
           </div>
+          )}
+
+          {layout === "stacked" && unifiedDiffLines(file).map((line, lineIndex) => (
+            line.type === "gap"
+              ? <DiffGapRow key={lineIndex} gap={line} />
+              : <StackedDiffLineView key={lineIndex} line={line} />
+          ))}
         </div>
       ))}
     </div>
+  );
+}
+
+/** Unchanged lines the patch leaves out between two hunks, across the whole width. */
+function DiffGapRow({ gap }: { gap: SplitDiffGap }) {
+  const { t } = useI18n();
+  return (
+    <div
+      style={{
+        gridColumn: "1 / -1",
+        padding: "0 10px",
+        color: "var(--text-dim)",
+        background: "var(--bg-panel)",
+        borderTop: "1px solid var(--border)",
+        borderBottom: "1px solid var(--border)",
+        userSelect: "none",
+      }}
+    >
+      {gap.count === null ? "⋯" : `⋯ ${diffGapLabel(gap.count, t)}`}
+    </div>
+  );
+}
+
+/** The file a stacked section is named for: the new path, the one that survives, unless the file was deleted. */
+function stackedFilePath(file: SplitDiffFile): string {
+  if (file.newPath && file.newPath !== "/dev/null") return file.newPath;
+  return file.oldPath || file.newPath || "";
+}
+
+function StackedDiffLineView({ line }: { line: UnifiedDiffLine }) {
+  return (
+    <SplitDiffCellView
+      side="right"
+      cell={{
+        // One gutter, so a removed line keeps the old number and everything else the new one.
+        lineNo: line.type === "removed" ? line.oldLineNo : line.newLineNo,
+        text: line.text,
+        type: line.type,
+      }}
+    />
   );
 }
 
@@ -1677,7 +1791,7 @@ function CustomMessageView({ message, cwd, onOpenFile }: { message: CustomMessag
     copyText(text || detailsText).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    });
+    }, () => {});
   };
 
   return (
@@ -1878,6 +1992,74 @@ export function getToolCallInputText(block: ToolCallContent): string {
   return block.rawInput ?? JSON.stringify(block.input, null, 2);
 }
 
+function parseStreamedInput(rawInput: string | undefined): unknown {
+  try {
+    return rawInput ? parsePartialJson(rawInput) : null;
+  } catch {
+    return null;
+  }
+}
+
+const WRITE_VIEW_KEYS = new Set(["path", "file_path", "content"]);
+
+// A write's file text in place of its JSON: the header already shows the path.
+// Streamed input is still incomplete JSON, and any other argument (a mode, a
+// title) would vanish from this view, so those calls, and an empty file, keep
+// the generic view.
+function getWrittenFileText(block: ToolCallContent): string | null {
+  if (block.rawInput !== undefined || !isWriteToolName(block.toolName)) return null;
+  const { content } = block.input;
+  if (typeof content !== "string" || content === "") return null;
+  return Object.keys(block.input).every((key) => WRITE_VIEW_KEYS.has(key)) ? content : null;
+}
+
+const TOOL_FIELD_LABEL: CSSProperties = {
+  padding: "4px 12px 4px 0",
+  color: "var(--text-dim)",
+  fontSize: "calc(11px + var(--chat-font-size-offset, 0px))",
+  whiteSpace: "nowrap",
+  verticalAlign: "top",
+};
+
+const TOOL_FIELD_VALUE: CSSProperties = {
+  padding: "4px 0",
+  color: "var(--text-muted)",
+  fontSize: "calc(12px + var(--chat-font-size-offset, 0px))",
+  fontFamily: "var(--font-mono)",
+  overflowWrap: "anywhere",
+};
+
+// A value with newlines of its own keeps them, scrolled in place.
+const TOOL_FIELD_BLOCK: CSSProperties = {
+  margin: 0,
+  padding: "8px 10px",
+  maxHeight: 260,
+  overflow: "auto",
+  border: "1px solid var(--border)",
+  borderRadius: 6,
+  background: "var(--bg)",
+  font: "inherit",
+  lineHeight: 1.5,
+  whiteSpace: "pre-wrap",
+};
+
+function ToolFieldRows({ fields }: { fields: ToolField[] }) {
+  return (
+    <table style={{ borderCollapse: "collapse" }}>
+      <tbody>
+        {fields.map((field) => (
+          <tr key={field.key}>
+            <td style={TOOL_FIELD_LABEL}>{field.key}</td>
+            <td style={TOOL_FIELD_VALUE}>
+              {field.multiline ? <pre style={TOOL_FIELD_BLOCK}>{field.value}</pre> : field.value}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function formatCustomType(type: string): string {
   return type || "extension";
 }
@@ -1913,13 +2095,23 @@ function formatUsage(usage: {
   cacheWrite: number;
   cost: { total: number };
 }): string {
+  // pi's TUI footer: ↑1.2k ↓567 R8.9k W12, with its formatTokens().
   const parts = [];
-  if (usage.input) parts.push(`${usage.input.toLocaleString()} in`);
-  if (usage.output) parts.push(`${usage.output.toLocaleString()} out`);
-  if (usage.cacheRead) parts.push(`${usage.cacheRead.toLocaleString()} cache R`);
-  if (usage.cacheWrite) parts.push(`${usage.cacheWrite.toLocaleString()} cache W`);
+  if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
+  if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
+  if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+  if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
   if (usage.cost?.total) parts.push(`$${usage.cost.total.toFixed(4)}`);
-  return parts.join(" · ");
+  return parts.join(" ");
+}
+
+/** pi's TUI `formatTokens()` (`formatNoticeTokens()` in the app's lib/transcript-notices.ts). */
+function formatTokens(count: number): string {
+  if (count < 1000) return count.toString();
+  if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
 }
 
 function BashExecutionView({ message, sessionId }: { message: BashExecutionMessage; sessionId?: string }) {

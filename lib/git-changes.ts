@@ -13,6 +13,8 @@ import {
   parseGitPorcelainV1,
   type GitPorcelainEntry,
 } from "./git-status";
+import { projectGitEnvironment } from "./git-environment";
+import { resolveExistingPath } from "./paths";
 
 const execFileAsync = promisify(execFile);
 const GIT_TIMEOUT_MS = 10_000;
@@ -22,22 +24,30 @@ async function git(cwd: string, args: string[], maxBuffer = GIT_STATUS_MAX_BUFFE
   const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], {
     timeout: GIT_TIMEOUT_MS,
     maxBuffer,
-    env: { ...process.env, LC_ALL: "C" },
+    env: projectGitEnvironment(),
   });
   return stdout;
 }
 
 async function findRepositoryRoot(cwd: string): Promise<string | null> {
   try {
-    return (await git(cwd, ["rev-parse", "--show-toplevel"])).trim() || null;
+    return (await git(cwd, ["rev-parse", "--show-toplevel"])).replace(/\r?\n$/, "") || null;
   } catch {
     return null;
   }
 }
 
 function isWithinPath(parent: string, target: string): boolean {
-  const relative = path.relative(path.resolve(parent), path.resolve(target));
+  return isRelativeWithin(path.relative(path.resolve(parent), path.resolve(target)));
+}
+
+/** Whether a `path.relative()` answer stays inside the folder it was taken from. */
+function isRelativeWithin(relative: string): boolean {
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function toGitPath(filePath: string): string {
@@ -66,6 +76,7 @@ async function readTrackedLineStats(
   const pathspec = relativeCwd || ".";
   try {
     const output = await git(repositoryRoot, [
+      "--literal-pathspecs",
       "diff",
       "--no-color",
       "--no-ext-diff",
@@ -90,20 +101,65 @@ async function readTrackedLineStats(
   }
 }
 
-function countUntrackedTextLines(filePath: string): number {
+const STATUS_ENTRIES_PER_TURN = 1000;
+// libuv's default thread pool: more reads only queue in front of the server's other fs work.
+const UNTRACKED_READ_CONCURRENCY = 4;
+const UNTRACKED_READ_CHUNK_BYTES = 64 * 1024;
+const NEWLINE = 0x0a;
+
+/**
+ * An untracked text file's lines as a new-file diff counts them: one per "\n", plus
+ * one for a last line without it. Empty, binary (a NUL byte), larger than the text
+ * preview, and anything but a regular file count 0. Read in chunks into `buffer`,
+ * up to the size lstat reported, as readFileSync read up to the size it found.
+ */
+async function countUntrackedTextLines(filePath: string, buffer: Buffer): Promise<number> {
   try {
-    const stat = fs.lstatSync(filePath);
-    if (!stat.isFile() || stat.size > TEXT_PREVIEW_MAX_BYTES) return 0;
-    const content = fs.readFileSync(filePath);
-    if (hasNullByte(content) || content.length === 0) return 0;
-    const text = content.toString("utf8");
-    return text.endsWith("\n") ? text.split("\n").length - 1 : text.split("\n").length;
+    const stat = await fs.promises.lstat(filePath);
+    if (!stat.isFile() || stat.size > TEXT_PREVIEW_MAX_BYTES || stat.size === 0) return 0;
+    const handle = await fs.promises.open(filePath, "r");
+    try {
+      let total = 0;
+      let newlines = 0;
+      let lastByte = -1;
+      while (total < stat.size) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, stat.size - total), null);
+        if (bytesRead === 0) break;
+        const chunk = buffer.subarray(0, bytesRead);
+        if (hasNullByte(chunk)) return 0;
+        for (let index = chunk.indexOf(NEWLINE); index !== -1; index = chunk.indexOf(NEWLINE, index + 1)) newlines++;
+        lastByte = chunk[bytesRead - 1];
+        total += bytesRead;
+      }
+      if (total === 0) return 0;
+      return lastByte === NEWLINE ? newlines : newlines + 1;
+    } finally {
+      await handle.close();
+    }
   } catch {
     return 0;
   }
 }
 
-export async function getGitStatus(cwd: string): Promise<GitStatusResponse> {
+// Async and a few files at a time: tens of thousands of untracked files read
+// synchronously held the server's event loop, every stream and request, for
+// seconds (#1584). Same counts, no cache. Stops when the request is gone.
+async function countUntrackedLines(filePaths: readonly string[], signal?: AbortSignal): Promise<number> {
+  let next = 0;
+  let total = 0;
+  const worker = async () => {
+    const buffer = Buffer.allocUnsafe(UNTRACKED_READ_CHUNK_BYTES);
+    while (next < filePaths.length && !signal?.aborted) {
+      const lines = await countUntrackedTextLines(filePaths[next++], buffer);
+      total += lines;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(UNTRACKED_READ_CONCURRENCY, filePaths.length) }, worker));
+  return total;
+}
+
+/** `signal`: the request's; once it aborts the scan stops and this throws. */
+export async function getGitStatus(cwd: string, signal?: AbortSignal): Promise<GitStatusResponse> {
   const repositoryRoot = await findRepositoryRoot(cwd);
   if (!repositoryRoot) {
     return {
@@ -115,25 +171,37 @@ export async function getGitStatus(cwd: string): Promise<GitStatusResponse> {
     };
   }
 
+  // Git names the repository by its real path, while the cwd may reach it through a
+  // link (`/tmp` and `/var/folders/…` are links on macOS): compare real paths, and
+  // report each file under the cwd as given, the way the file tree lists it.
+  const realRoot = resolveExistingPath(repositoryRoot);
+  const realCwd = resolveExistingPath(cwd);
   const [entries, trackedLineStats] = await Promise.all([
     readStatusEntries(repositoryRoot),
-    readTrackedLineStats(repositoryRoot, cwd),
+    readTrackedLineStats(realRoot, realCwd),
   ]);
-  const files = entries.flatMap((entry): GitFileStatus[] => {
-    const filePath = path.resolve(repositoryRoot, entry.path);
-    if (!isWithinPath(cwd, filePath)) return [];
-    const classified = classifyGitStatus(entry);
-    return [{
-      filePath,
-      ...classified,
+  const files: GitFileStatus[] = [];
+  for (let index = 0; index < entries.length; index++) {
+    // Tens of thousands of paths take long enough to stall the server on their own.
+    if (index > 0 && index % STATUS_ENTRIES_PER_TURN === 0) {
+      await yieldToEventLoop();
+      signal?.throwIfAborted();
+    }
+    const entry = entries[index];
+    const relative = path.relative(realCwd, path.resolve(realRoot, entry.path));
+    if (!isRelativeWithin(relative)) continue;
+    files.push({
+      filePath: path.join(cwd, relative),
+      ...classifyGitStatus(entry),
       indexStatus: entry.indexStatus,
       worktreeStatus: entry.worktreeStatus,
-    }];
-  });
-  const untrackedAdditions = files.reduce(
-    (total, file) => total + (file.status === "untracked" ? countUntrackedTextLines(file.filePath) : 0),
-    0,
+    });
+  }
+  const untrackedAdditions = await countUntrackedLines(
+    files.flatMap((file) => (file.status === "untracked" ? [file.filePath] : [])),
+    signal,
   );
+  signal?.throwIfAborted();
 
   return {
     isGitRepository: true,
@@ -149,6 +217,7 @@ function hasNullByte(content: Buffer): boolean {
 }
 
 function createAddedFilePatch(gitPath: string, content: string): string {
+  if (content.length === 0) return "";
   const hasTrailingNewline = content.endsWith("\n");
   const lines = content.split("\n");
   if (hasTrailingNewline) lines.pop();
@@ -178,6 +247,7 @@ async function createTrackedFilePatch(
   try {
     return await git(repositoryRoot, [
       ...gitConfig,
+      "--literal-pathspecs",
       "diff",
       "--no-color",
       "--no-ext-diff",
@@ -206,15 +276,21 @@ async function findFileRepositoryRoot(cwd: string, filePath: string): Promise<st
 
 export async function getGitFileDiff(cwd: string, filePath: string): Promise<GitFileDiffResponse> {
   const repositoryRoot = await findFileRepositoryRoot(cwd, filePath);
-  if (!repositoryRoot || !isWithinPath(repositoryRoot, filePath)) return { supported: false };
+  if (!repositoryRoot) return { supported: false };
+  // Git names the repository by its real path, while the file and the cwd may be named
+  // through a link: compare real paths. A file whose real path leaves the repository
+  // stays out; the route has already checked that real path against the allowed roots.
+  const realRoot = resolveExistingPath(repositoryRoot);
+  const realFilePath = resolveExistingPath(filePath);
+  if (!isWithinPath(realRoot, realFilePath)) return { supported: false };
   // Reading the index runs a repository-configured fsmonitor hook. Opening a
   // file in another checkout (one nested in the cwd, say) must not run its hook,
   // as expanding that folder in the file tree does not (lib/file-tree-visibility.ts);
   // the cwd's own repository keeps its fsmonitor.
-  const gitConfig = isWithinPath(repositoryRoot, cwd) ? [] : ["-c", "core.fsmonitor=false"];
+  const gitConfig = isWithinPath(realRoot, resolveExistingPath(cwd)) ? [] : ["-c", "core.fsmonitor=false"];
 
   const resolvedFilePath = path.resolve(filePath);
-  const relativePath = toGitPath(path.relative(repositoryRoot, resolvedFilePath));
+  const relativePath = toGitPath(path.relative(realRoot, realFilePath));
   const entries = await readStatusEntries(repositoryRoot, gitConfig);
   const entry = entries.find((candidate) => candidate.path === relativePath);
   if (!entry) return { supported: false };

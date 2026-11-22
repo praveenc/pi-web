@@ -408,8 +408,8 @@ function ProviderDetail({ name, provider, onChange, onRename, onDelete, onAddMod
         </ConfigDetailActions>
       </ConfigDetailHeader>
 
-       <Field label={t("i18n.providerName")}>
-        <TextInput value={editingName} onChange={setEditingName} placeholder="provider-name" mono />
+       <Field label={t("i18n.providerId")}>
+        <TextInput value={editingName} onChange={setEditingName} placeholder="provider-id" mono />
         {editingName !== name && editingName.trim() && (
           <button onClick={() => onRename(editingName.trim())}
             style={{ marginTop: 4, padding: "3px 10px", background: "var(--accent)", border: "none", borderRadius: 4, color: "var(--accent-contrast)", cursor: "pointer", fontSize: 11, alignSelf: "flex-start" }}>
@@ -1723,7 +1723,7 @@ function AddProviderPicker({
 
   const q = search.trim().toLowerCase();
 
-  const availableOAuth = oauthProviders.filter((p) => !p.loggedIn && (!q || p.name.toLowerCase().includes(q)));
+  const availableOAuth = oauthProviders.filter((p) => !p.loggedIn && (!q || p.name.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)));
   const availableApiKey = apiKeyProviders.filter((p) => !p.configured && (!q || p.displayName.toLowerCase().includes(q) || p.id.toLowerCase().includes(q)));
   const showCustom = !q || "custom".includes(q) || "openai-compatible".includes(q) || "anthropic-compatible".includes(q);
 

@@ -8,13 +8,14 @@ import { isAbsolute, join, normalize as normalizePath, relative, resolve as reso
 import type { AgentMessage, ImageContent, SessionEntry, SessionHeader, SessionInfo, SessionContext } from "./types";
 import { normalizeToolCalls } from "./normalize";
 import { withoutMessageSignatures } from "./message-signatures";
-import { getThinkingPreview, isMessageGroupAnchor } from "./message-display";
+import { getThinkingPreview, getTurnAnchors, type TurnAnchorMessage } from "./message-display";
 import { projectIdentityKey } from "./project-identity";
 import { sessionPathKey } from "./session-path";
 import { skillExpansionToCommand } from "./slash-display";
 import { MAX_TOOL_RESULT_IMAGE_BYTES, TOOL_RESULT_IMAGE_MIMES } from "./tool-result-images";
 import { resolveProject, type ProjectInfo } from "./worktree";
 import { readSubagentRun, SUBAGENT_META_TYPE } from "./subagents";
+import { readSideRelation } from "./side-session";
 import { checkSessionMembership, listSessionsIncremental, scanSessionFileInfo, type ScannedSessionInfo } from "./session-list-scanner";
 
 export { getAgentDir };
@@ -186,34 +187,38 @@ export function mergeSessionLists(
 }
 
 type ScannedSubagent = NonNullable<ReturnType<typeof readSubagentRun>>;
+type ScannedSide = NonNullable<ReturnType<typeof readSideRelation>>;
 
 /**
- * A fork's or subagent's run, read from its file, per scanned row. The scanner
- * hands back the same row object while the file's size and mtime stay the same
- * and a new one once they change, so the row is the cache key: every list
- * rebuild re-read ~140 subagent files synchronously (~36 ms of blocked event
- * loop) though only the session that just ran had changed.
+ * A subagent's run or a side chat's parent, read from its file, per scanned
+ * row. The scanner hands back the same row object while the file's size and
+ * mtime stay the same and a new one once they change, so the row is the cache
+ * key: every list rebuild re-read ~140 subagent files synchronously (~36 ms of
+ * blocked event loop) though only the session that just ran had changed.
  */
-const scannedSubagentRuns = new WeakMap<ScannedSessionInfo, ScannedSubagent | null>();
+const scannedSubagentRuns = new WeakMap<ScannedSessionInfo, { subagent: ScannedSubagent | null; side: ScannedSide | null }>();
 
 function resolveScannedSessionRelation(
   scanned: ScannedSessionInfo,
   pathToId: Map<string, string>,
-): { originSessionId?: string; subagent: ScannedSubagent | null } {
+): { originSessionId?: string; subagent: ScannedSubagent | null; side: ScannedSide | null } {
   const originSessionId = scanned.parentSessionPath
     ? pathToId.get(sessionPathKey(scanned.parentSessionPath))
     : undefined;
-  if (!scanned.parentSessionPath) return { originSessionId, subagent: null };
+  if (!scanned.parentSessionPath) return { originSessionId, subagent: null, side: null };
 
   const cached = scannedSubagentRuns.get(scanned);
-  if (cached !== undefined) return { originSessionId, subagent: cached };
+  if (cached !== undefined) return { originSessionId, ...cached };
   try {
-    const subagent = readSubagentRun(readSessionRelationEntries(scanned.path), scanned.id, scanned.path);
-    scannedSubagentRuns.set(scanned, subagent);
-    return { originSessionId, subagent };
+    const relationEntries = readSessionRelationEntries(scanned.path);
+    const subagent = readSubagentRun(relationEntries, scanned.id, scanned.path);
+    const side = subagent ? null : readSideRelation(relationEntries);
+    const resolved = { subagent, side };
+    scannedSubagentRuns.set(scanned, resolved);
+    return { originSessionId, ...resolved };
   } catch {
     // Malformed or concurrently removed session: read it again next time.
-    return { originSessionId, subagent: null };
+    return { originSessionId, subagent: null, side: null };
   }
 }
 
@@ -238,7 +243,7 @@ function mapScannedSession(
   pathToId: Map<string, string>,
 ): SessionInfo {
   cacheSessionPath(scanned.id, scanned.path);
-  const { originSessionId, subagent } = resolveScannedSessionRelation(scanned, pathToId);
+  const { originSessionId, subagent, side } = resolveScannedSessionRelation(scanned, pathToId);
   const detailsPending = scanned.detailsPending === true;
   return {
     path: scanned.path,
@@ -256,9 +261,11 @@ function mapScannedSession(
     parentSessionId: originSessionId,
     ...(subagent
       ? { relation: { kind: "subagent" as const, parentSessionId: subagent.parentSessionId, profile: subagent.profile, description: subagent.description, status: subagent.status } }
-      : scanned.parentSessionPath
-        ? { relation: { kind: "fork" as const, ...(originSessionId ? { originSessionId } : {}) } }
-        : {}),
+      : side
+        ? { relation: { kind: "side" as const, ...side } }
+        : scanned.parentSessionPath
+          ? { relation: { kind: "fork" as const, ...(originSessionId ? { originSessionId } : {}) } }
+          : {}),
     transient: false,
     ...(detailsPending ? { detailsPending: true } : {}),
   };
@@ -675,7 +682,7 @@ export function getLatestModelChange(entries: SessionEntry[]): SessionContext["m
   return null;
 }
 
-function getSessionSettings(entries: SessionEntry[], leafId?: string | null): Pick<SessionContext, "thinkingLevel" | "model"> {
+export function getSessionSettings(entries: SessionEntry[], leafId?: string | null): Pick<SessionContext, "thinkingLevel" | "model"> {
   if (leafId === null) return { thinkingLevel: "off", model: null };
   const branch = sliceActiveBranch(entries, leafId ?? null, entries.length);
   let thinkingLevel: string | undefined;
@@ -721,7 +728,7 @@ export function buildSessionContext(
     entries, leafId ?? null, tail && tail > 0 ? tail : entries.length, excludeLeaf,
   );
   const hasMore = Boolean(tail && tail > 0 && sliced[0]?.parentId);
-  const turnsBefore = hasMore ? countTurnsBefore(entries, sliced[0]) : 0;
+  const turnsBefore = hasMore ? countTurnsBefore(entries, sliced) : 0;
 
   // Convert messages and their IDs together to keep fork/navigation targets aligned.
   const messages: AgentMessage[] = [];
@@ -745,10 +752,10 @@ export function buildSessionContext(
 }
 
 /**
- * The fields of entryToUiMessage()'s result that isMessageGroupAnchor() reads,
+ * The fields of entryToUiMessage()'s result that getTurnAnchors() reads,
  * without converting the entry's body.
  */
-function turnAnchorShape(entry: SessionEntry): Parameters<typeof isMessageGroupAnchor>[0] | null {
+function turnAnchorShape(entry: SessionEntry): TurnAnchorMessage | null {
   switch (entry.type) {
     case "message":
       return entry.message.role === "system" ? null : entry.message as AgentMessage;
@@ -764,19 +771,31 @@ function turnAnchorShape(entry: SessionEntry): Parameters<typeof isMessageGroupA
 }
 
 /**
- * Turns on the branch above `oldest`, the first entry of a page: the anchors
- * the chat would group by (#791). The minimap numbers loaded turns from it, so
- * a turn keeps its number as older pages load.
+ * Turns on the branch above a page (`page[0]` is its oldest entry): the anchors
+ * the chat would group by (#791), from getTurnAnchors() over the branch down to
+ * the page's end. The minimap numbers loaded turns from it, so a turn keeps its
+ * number as older pages load. An anchor at the page's start that only the reply
+ * above it makes one (an extension's message that opened a run) counts too:
+ * the chat has no reply above its first message, so it shows that turn as the
+ * page's leading segment, like a turn whose anchor is on the page above.
  */
-function countTurnsBefore(entries: SessionEntry[], oldest: SessionEntry): number {
+function countTurnsBefore(entries: SessionEntry[], page: SessionEntry[]): number {
   const byId = new Map<string, SessionEntry>();
   for (const e of entries) byId.set(e.id, e);
-  let turns = 0;
-  let current = oldest.parentId ? byId.get(oldest.parentId) : undefined;
+  const above: TurnAnchorMessage[] = [];
+  let current = page[0]?.parentId ? byId.get(page[0].parentId) : undefined;
   while (current) {
     const shape = turnAnchorShape(current);
-    if (shape && isMessageGroupAnchor(shape)) turns++;
+    if (shape) above.push(shape);
     current = current.parentId ? byId.get(current.parentId) : undefined;
+  }
+  above.reverse();
+  const shown = page.map(turnAnchorShape).filter((shape): shape is TurnAnchorMessage => shape !== null);
+  const onBranch = getTurnAnchors([...above, ...shown]);
+  const onPage = getTurnAnchors(shown);
+  let turns = 0;
+  for (let idx = 0; idx < onBranch.length; idx++) {
+    if (onBranch[idx] && (idx < above.length || !onPage[idx - above.length])) turns++;
   }
   return turns;
 }

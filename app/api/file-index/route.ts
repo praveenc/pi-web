@@ -9,6 +9,7 @@ import {
   isFilePathAllowed,
   isWindowsAbsolutePath,
 } from "@/lib/file-access";
+import { projectGitEnvironment } from "@/lib/git-environment";
 import { buildEntriesFromFiles, filterFileEntries, type FileIndexEntry } from "@/lib/file-fuzzy";
 import { isHiddenOutsideGit } from "@/lib/file-tree-visibility";
 
@@ -55,7 +56,7 @@ async function listWithGit(cwd: string): Promise<FileListing | null> {
     const { stdout } = await execFileAsync(
       "git",
       ["-C", cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-      { timeout: 10_000, maxBuffer: 64 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" } },
+      { timeout: 10_000, maxBuffer: 64 * 1024 * 1024, env: projectGitEnvironment() },
     );
     const all = stdout.split("\0").filter(Boolean);
     if (all.length > GIT_HARD_CAP) {
@@ -109,7 +110,7 @@ function listWithWalk(cwd: string): FileListing {
 // Guarded by the same allow-list as /api/files.
 export async function GET(req: NextRequest) {
   try {
-    const cwd = req.nextUrl.searchParams.get("cwd")?.trim() ?? "";
+    const cwd = req.nextUrl.searchParams.get("cwd") ?? "";
     if (!cwd || (!cwd.startsWith("/") && !isWindowsAbsolutePath(cwd))) {
       return NextResponse.json({ error: "cwd must be an absolute path" }, { status: 400 });
     }

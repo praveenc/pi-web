@@ -9,6 +9,14 @@ import type {
 import type { AgentMessage as PiAgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 
+export interface BashResultLike {
+  output: string;
+  exitCode?: number;
+  cancelled?: boolean;
+  truncated?: boolean;
+  fullOutputPath?: string;
+}
+
 export interface ContextUsage {
   percent: number | null;
   contextWindow: number;
@@ -74,6 +82,10 @@ interface SkillLike {
 
 interface ResourceLoaderLike {
   getSkills(): { skills: SkillLike[] };
+  getExtensions?(): {
+    errors?: readonly { path: string; error: string }[];
+    warnings?: readonly { path: string; warning: string }[];
+  };
   getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
 }
 
@@ -83,7 +95,15 @@ interface ExtensionRunnerLike {
     description?: string;
     sourceInfo: SlashCommandInfo["sourceInfo"];
   }>;
-  emit?(event: { type: "session_shutdown"; reason: "quit" }): Promise<unknown>;
+  emit?(event:
+    | { type: "session_shutdown"; reason: "quit" }
+    | { type: "session_before_fork"; entryId: string; position: "before" | "at" }
+  ): Promise<unknown>;
+  hasHandlers?(eventType: string): boolean;
+  /** pi's `user_bash` hook: an extension may run a `!` command itself (`result`) or say how (`operations`). */
+  emitUserBash?(event: { type: "user_bash"; command: string; excludeFromContext: boolean; cwd: string }): Promise<
+    { operations: BashOperations; result?: never } | { operations?: never; result: BashResultLike } | undefined
+  >;
   setUIContext?(uiContext?: unknown, mode?: "tui" | "rpc" | "json" | "print"): void;
 }
 
@@ -137,7 +157,7 @@ export interface AgentSessionLike {
   readonly model: ModelLike | undefined;
   readonly modelRuntime: {
     getModel: (provider: string, modelId: string) => ModelLike | undefined;
-    refresh: (options?: { allowNetwork?: boolean }) => Promise<unknown>;
+    refresh: (options?: { allowNetwork?: boolean; providers?: string[]; signal?: AbortSignal }) => Promise<unknown>;
   };
   readonly sessionManager: SessionManager;
   readonly settingsManager: SettingsManager;
@@ -150,14 +170,19 @@ export interface AgentSessionLike {
    */
   readonly systemPrompt: string;
   readonly agent: {
+    readonly toolExecution: "parallel" | "sequential";
     state?: {
       /** Replayed from the transcript's system messages since Pi 0.86; never assign it. */
       readonly systemPrompt?: string;
       thinkingLevel?: string;
       streamingMessage?: PiAgentMessage;
       /** The declared tools, with the descriptions `prepareLoadout` hooks set for the model. */
-      readonly tools?: readonly { readonly name: string; readonly description: string }[];
+      readonly tools?: readonly { readonly name: string; readonly description: string; readonly executionMode?: "parallel" | "sequential" }[];
     };
+    /** Steers and follow-ups pi has queued, its custom messages included (`getSteeringMessages()` lists texts only). */
+    hasQueuedMessages(): boolean;
+    /** The current run's abort signal; Stop aborts it. */
+    readonly signal?: AbortSignal;
   };
   readonly extensionRunner: ExtensionRunnerLike;
   readonly promptTemplates: readonly PromptTemplateLike[];
@@ -187,9 +212,13 @@ export interface AgentSessionLike {
   executeBash(command: string, onChunk?: (chunk: string) => void, options?: {
     excludeFromContext?: boolean;
     operations?: BashOperations;
-  }): Promise<{ output: string; exitCode?: number; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string }>;
+  }): Promise<BashResultLike>;
+  /** Writes a `!` command's result to the session, as executeBash does; for a result an extension produced. */
+  recordBashResult?(command: string, result: BashResultLike, options?: { excludeFromContext?: boolean }): void;
   abortBash(): void;
   readonly isBashRunning: boolean;
+  /** An auto-retry waiting out its backoff; optional because test sessions leave it out. */
+  readonly isRetrying?: boolean;
   setModel(model: ModelLike): Promise<void>;
   navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<NavigateTreeResult>;
   setThinkingLevel(level: string): void;

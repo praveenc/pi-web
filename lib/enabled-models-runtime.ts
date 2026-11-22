@@ -16,6 +16,7 @@ import {
   type EnabledModelsView,
   type PatternResolution,
 } from "./enabled-models";
+import { getProjectTrustStatus } from "./project-trust";
 
 /**
  * SDK adapter for the pure `enabledModels` editor in `lib/enabled-models.ts`.
@@ -51,8 +52,9 @@ export async function resolvePatternMatches(
     try {
       ({ scopedModels } = await resolveModelScopeWithDiagnostics([pattern], snapshotRuntime));
     } catch {
-      // An ambiguous or malformed entry still belongs to the user's config;
-      // treat it as matching nothing so it is preserved verbatim.
+      // A malformed entry still belongs to the user's config; treat it as
+      // matching nothing so it is preserved verbatim. (An ambiguous bare id
+      // resolves to every provider offering it, pi 1.3.)
       scopedModels = [];
     }
     const pin = scopedModels.find((scoped) => scoped.thinkingLevel)?.thinkingLevel;
@@ -207,6 +209,18 @@ export function displaySettingsPath(path: string): string {
   if (!home || !path.startsWith(home)) return path;
   const rest = path.slice(home.length);
   return rest === "" || rest.startsWith(sep) ? `~${rest}` : path;
+}
+
+/**
+ * The settings Settings › Models reads `enabledModels` from. pi creates a
+ * `SettingsManager` trusting the project unless told otherwise, so an untrusted
+ * folder's `.pi/settings.json` would otherwise shadow the global list here while
+ * its sessions ignore it. Trusted only by the folder's decision, as sessions are.
+ */
+export function createEnabledModelsSettingsManager(cwd: string, agentDir: string): SettingsManager {
+  return SettingsManager.create(cwd, agentDir, {
+    projectTrusted: getProjectTrustStatus(cwd, agentDir).trusted,
+  });
 }
 
 /**
